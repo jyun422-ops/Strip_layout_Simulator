@@ -73,14 +73,11 @@ def find_best_zigzag(part, bridge):
         except: continue
     return best_part_a, best_part_b, best_pair_geom
 
-# --- [추가] 스트립 공도도 렌더링 함수 ---
+# --- [추가] 스트립 Layout도 렌더링 함수 ---
 def plot_strip_layout(parts_and_colors, pitch, strip_width, margin, total_stations):
-    # 피치 수에 비례하여 도면 가로 길이를 넓게 설정
     fig, ax = plt.subplots(figsize=(max(8, total_stations * 2), 3.5))
-    
     total_length = pitch * total_stations
     
-    # 금형 최소 작업구간 (Die Core) 경계 그리기
     ax.plot([0, total_length, total_length, 0, 0], [0, 0, strip_width, strip_width, 0], 
             color='red', linestyle='-', linewidth=2.5, 
             label=f'금형 코어 최소 사이즈\n(가로: {total_length:.1f} x 세로: {strip_width:.1f})')
@@ -88,25 +85,22 @@ def plot_strip_layout(parts_and_colors, pitch, strip_width, margin, total_statio
     all_geoms = unary_union([p[0] for p in parts_and_colors])
     minx, miny, maxx, maxy = all_geoms.bounds
     
-    # 부품을 첫 번째 피치 박스의 정중앙에 위치시키기 위한 오프셋 계산
     x_offset = -minx + (pitch - (maxx - minx)) / 2
     y_offset = -miny + margin
     
-    # 스테이션 수만큼 부품을 반복해서 복사하여 그리기
     for i in range(total_stations):
         for geom, color in parts_and_colors:
             shifted = translate(geom, xoff=x_offset + (i * pitch), yoff=y_offset)
             ax.plot(*shifted.exterior.xy, color=color, linewidth=1.5)
             ax.fill(*shifted.exterior.xy, alpha=0.5, color=color)
         
-        # 피치(스테이션) 구분 점선 그리기
         if i < total_stations - 1:
             ax.plot([pitch * (i+1), pitch * (i+1)], [0, strip_width], color='black', linestyle=':', alpha=0.4)
             
     ax.axis('equal')
     ax.set_xticks([])
     ax.set_yticks([])
-    ax.legend(loc='center left', bbox_to_anchor=(1.02, 0.5)) # 범례를 그래프 바깥 우측에 고정
+    ax.legend(loc='center left', bbox_to_anchor=(1.02, 0.5)) 
     plt.tight_layout()
     return fig
 
@@ -132,7 +126,7 @@ st.sidebar.header("📏 2. 배열 간격 (다이 강도 고려)")
 bridge = st.sidebar.number_input("최소 브릿지 (mm)", value=float(round(rec_bridge, 1)), step=0.1)
 margin = st.sidebar.number_input("가장자리 마진 (mm)", value=float(round(rec_margin, 1)), step=0.1)
 
-st.sidebar.header("🛠️ 3. 공도도(Strip Layout) 설계")
+st.sidebar.header("🛠️ 3. Layout도 설계")
 st_notch = st.sidebar.number_input("노칭 / 파이롯트 홀", value=1, step=1)
 st_pierce = st.sidebar.number_input("피어싱 (내측 홀 타발)", value=1, step=1)
 st_form = st.sidebar.number_input("벤딩 / 포밍", value=0, step=1)
@@ -292,34 +286,37 @@ if uploaded_file is not None:
                     st.warning("지그재그 배열 불가 형상")
 
             # ==========================================
-            # 화면 분리 2: 공도도 도면 및 금형 사이즈
+            # 화면 분리 2: Layout도 도면 및 금형 사이즈 (순차적 표시)
             # ==========================================
             st.divider()
-            st.header("🎞️ [2단계] 스트립 레이아웃 (공도도) 및 금형 코어 사이즈 도출")
+            st.header("🎞️ [2단계] 스트립 Layout도 및 금형 코어 사이즈 도출")
             st.markdown(f"좌측에서 입력하신 **총 {total_stations} 피치**를 기준으로 한 실제 금형 내부 작업 구간의 설계 도면입니다.")
             
-            tab1, tab2, tab3 = st.tabs(["[1] 단일 배열 공도도", "[2] 180도 교차 배열 공도도", "[3] 지그재그 배열 공도도"])
-            
-            with tab1:
-                l_val = best_s_p * total_stations
-                st.info(f"📐 **단일 배열 금형 코어 최소 사이즈:** 가로(L) :blue[**{l_val:.1f} mm**] × 세로(W) :blue[**{best_s_w:.1f} mm**]")
-                fig_strip1 = plot_strip_layout([(best_s_part, '#004b87')], best_s_p, best_s_w, margin, total_stations)
-                st.pyplot(fig_strip1)
+            # --- [1] 단일 배열 Layout도 ---
+            st.subheader("◼️ [1] 단일 배열 Layout도")
+            l_val_s = best_s_p * total_stations
+            st.info(f"📐 **단일 배열 금형 코어 최소 사이즈:** 가로(L) :blue[**{l_val_s:.1f} mm**] × 세로(W) :blue[**{best_s_w:.1f} mm**]")
+            fig_strip1 = plot_strip_layout([(best_s_part, '#004b87')], best_s_p, best_s_w, margin, total_stations)
+            st.pyplot(fig_strip1)
 
-            with tab2:
-                if pair_i_geom:
-                    l_val = best_i_p * total_stations
-                    st.info(f"📐 **180도 교차 배열 금형 코어 최소 사이즈:** 가로(L) :blue[**{l_val:.1f} mm**] × 세로(W) :blue[**{best_i_w:.1f} mm**]")
-                    fig_strip2 = plot_strip_layout([(best_i_part_a, '#004b87'), (best_i_part_b, '#007934')], best_i_p, best_i_w, margin, total_stations)
-                    st.pyplot(fig_strip2)
-                else:
-                    st.warning("이 부품은 180도 교차 배열이 불가능합니다.")
+            # --- [2] 180도 교차 배열 Layout도 ---
+            st.divider()
+            st.subheader("◼️ [2] 180도 교차 배열 Layout도")
+            if pair_i_geom:
+                l_val_i = best_i_p * total_stations
+                st.info(f"📐 **180도 교차 배열 금형 코어 최소 사이즈:** 가로(L) :blue[**{l_val_i:.1f} mm**] × 세로(W) :blue[**{best_i_w:.1f} mm**]")
+                fig_strip2 = plot_strip_layout([(best_i_part_a, '#004b87'), (best_i_part_b, '#007934')], best_i_p, best_i_w, margin, total_stations)
+                st.pyplot(fig_strip2)
+            else:
+                st.warning("이 부품은 180도 교차 배열이 불가능합니다.")
 
-            with tab3:
-                if pair_z_geom:
-                    l_val = best_z_p * total_stations
-                    st.info(f"📐 **지그재그 배열 금형 코어 최소 사이즈:** 가로(L) :blue[**{l_val:.1f} mm**] × 세로(W) :blue[**{best_z_w:.1f} mm**]")
-                    fig_strip3 = plot_strip_layout([(best_z_part_a, '#004b87'), (best_z_part_b, '#d55e00')], best_z_p, best_z_w, margin, total_stations)
-                    st.pyplot(fig_strip3)
-                else:
-                    st.warning("이 부품은 지그재그 배열이 불가능합니다.")
+            # --- [3] 지그재그 배열 Layout도 ---
+            st.divider()
+            st.subheader("◼️ [3] 지그재그 배열 Layout도")
+            if pair_z_geom:
+                l_val_z = best_z_p * total_stations
+                st.info(f"📐 **지그재그 배열 금형 코어 최소 사이즈:** 가로(L) :blue[**{l_val_z:.1f} mm**] × 세로(W) :blue[**{best_z_w:.1f} mm**]")
+                fig_strip3 = plot_strip_layout([(best_z_part_a, '#004b87'), (best_z_part_b, '#d55e00')], best_z_p, best_z_w, margin, total_stations)
+                st.pyplot(fig_strip3)
+            else:
+                st.warning("이 부품은 지그재그 배열이 불가능합니다.")
