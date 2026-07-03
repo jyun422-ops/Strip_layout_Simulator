@@ -10,7 +10,7 @@ from shapely.ops import unary_union
 import tempfile
 import os
 
-# --- [1] 핵심 알고리즘 함수 ---
+# --- [1] 핵심 알고리즘 함수 (180도 교차 배열용) ---
 def find_best_interlock(part, bridge):
     part_b_rotated = rotate(part, 180, origin='centroid')
     buffered_a = part.buffer(bridge, resolution=4)
@@ -42,37 +42,6 @@ def find_best_interlock(part, bridge):
         except: continue
     return best_part_a, best_part_b, best_pair_geom
 
-def find_best_zigzag(part, bridge):
-    part_b_same = part 
-    buffered_a = part.buffer(bridge, resolution=4)
-    minx, miny, maxx, maxy = part.bounds
-    w, h = maxx - minx, maxy - miny
-    
-    best_pair_geom, best_part_a, best_part_b = None, part, None
-    min_box_area = float('inf')
-    
-    for dy in np.linspace(-h*0.8, h*0.8, 30): 
-        dx, step = w * 1.5, w / 20 
-        while dx > -w:
-            test_b = translate(part_b_same, xoff=dx, yoff=dy)
-            if buffered_a.intersects(test_b): dx += step; break
-            dx -= step
-        fine_step = step / 10
-        while dx > -w:
-            test_b = translate(part_b_same, xoff=dx, yoff=dy)
-            if buffered_a.intersects(test_b): dx += fine_step; break
-            dx -= fine_step
-            
-        test_b = translate(part_b_same, xoff=dx, yoff=dy)
-        try:
-            pair = unary_union([part, test_b])
-            p_minx, p_miny, p_maxx, p_maxy = pair.bounds
-            box_area = (p_maxx - p_minx) * (p_maxy - p_miny)
-            if box_area < min_box_area:
-                min_box_area, best_pair_geom, best_part_b = box_area, pair, test_b
-        except: continue
-    return best_part_a, best_part_b, best_pair_geom
-
 # --- [추가] 스트립 Layout도 렌더링 함수 ---
 def plot_strip_layout(parts_and_colors, pitch, strip_width, margin, total_stations):
     fig, ax = plt.subplots(figsize=(max(8, total_stations * 2), 3.5))
@@ -85,8 +54,8 @@ def plot_strip_layout(parts_and_colors, pitch, strip_width, margin, total_statio
     all_geoms = unary_union([p[0] for p in parts_and_colors])
     minx, miny, maxx, maxy = all_geoms.bounds
     
-    x_offset = -minx + (pitch - (maxx - minx)) / 2
     y_offset = -miny + margin
+    x_offset = -minx + (pitch * 0.2) 
     
     for i in range(total_stations):
         for geom, color in parts_and_colors:
@@ -137,11 +106,12 @@ st_simul = st.sidebar.number_input("➖ 동시 성형 (중복 차감)", value=0,
 total_stations = max(1, int((st_notch + st_pierce + st_form + st_blank + st_idle) - st_simul))
 st.sidebar.info(f"**총 예상 스테이션: {total_stations} 피치**")
 
+
 # --- [3] 메인 화면 동작 로직 ---
 uploaded_file = st.file_uploader("DXF 전개도면을 업로드하세요.", type=['dxf'])
 
 if uploaded_file is not None:
-    with st.spinner('안전 간격 적용 및 3가지 배열 경우의 수를 분석 중입니다... (약 15초 소요)'):
+    with st.spinner('새로운 다열 엇갈림 알고리즘으로 최적 배열을 계산 중입니다... (약 15초 소요)'):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp:
             tmp.write(uploaded_file.getvalue())
             tmp_path = tmp.name
@@ -199,25 +169,65 @@ if uploaded_file is not None:
                         best_i_util, best_i_cost, best_i_angle, best_i_pair, best_i_w, best_i_p = util, cost, angle, rot_pair, w_val, p_val
                         best_i_part_a, best_i_part_b = rot_a, rot_b
 
-            # --- [Case 3] 지그재그 배열 ---
-            part_z_a, part_z_b, pair_z_geom = find_best_zigzag(part, bridge)
+            # --- [Case 3] 진정한 다열 지그재그(Staggered) 배열 알고리즘 ---
             zigzag_results = []
-            best_z_util, best_z_cost, best_z_angle, best_z_pair = 0, float('inf'), 0, None
+            best_z_util, best_z_cost, best_z_angle = 0, float('inf'), 0
             best_z_part_a, best_z_part_b = None, None
             best_z_w, best_z_p = 0, 0
-            if pair_z_geom:
-                for angle in range(0, 180, 10):
-                    rot_a = rotate(part_z_a, angle, origin=pair_z_geom.centroid)
-                    rot_b = rotate(part_z_b, angle, origin=pair_z_geom.centroid)
-                    rot_pair = unary_union([rot_a, rot_b])
-                    minx, miny, maxx, maxy = rot_pair.bounds
-                    p_val, w_val = (maxx - minx) + bridge, (maxy - miny) + (margin * 2)
-                    util = (pair_area / (p_val * w_val)) * 100
-                    cost = ((((p_val * w_val * material_thickness) * material_density) / 1000000) * material_price) / 2
-                    zigzag_results.append({'각도': f"{angle}°", '피치(mm)': round(p_val,2), '소재폭(mm)': round(w_val,2), '소재이용율(%)': round(util,2), '1개당 원가(원)': int(cost)})
-                    if util > best_z_util: 
-                        best_z_util, best_z_cost, best_z_angle, best_z_pair, best_z_w, best_z_p = util, cost, angle, rot_pair, w_val, p_val
-                        best_z_part_a, best_z_part_b = rot_a, rot_b
+            
+            for angle in range(0, 180, 10):
+                rot_part = rotate(part, angle, origin='center')
+                minx, miny, maxx, maxy = rot_part.bounds
+                w, h = maxx - minx, maxy - miny
+                
+                # 피치(Pitch)는 무조건 부품 1개의 폭 + 브릿지로 고정 (진정한 다열 진행)
+                p_val = w + bridge
+                
+                buffered_a = rot_part.buffer(bridge, resolution=4)
+                buffered_b = translate(buffered_a, xoff=p_val, yoff=0)
+                
+                min_dy = float('inf')
+                best_dx = 0
+                
+                # 두 번째 열(Row 2)을 x축으로 조금씩 이동하며 가장 콤팩트한 y축 안착 위치를 찾음
+                for dx in np.linspace(0, p_val, 25):
+                    dy = h
+                    step = h / 20
+                    test_b = translate(rot_part, xoff=dx, yoff=dy)
+                    while not (buffered_a.intersects(test_b) or buffered_b.intersects(test_b)):
+                        dy -= step
+                        if dy < -h: break
+                        test_b = translate(rot_part, xoff=dx, yoff=dy)
+                    
+                    dy += step
+                    fine_step = step / 10
+                    test_b = translate(rot_part, xoff=dx, yoff=dy)
+                    while not (buffered_a.intersects(test_b) or buffered_b.intersects(test_b)):
+                        dy -= fine_step
+                        if dy < -h: break
+                        test_b = translate(rot_part, xoff=dx, yoff=dy)
+                    dy += fine_step
+                    
+                    if dy < min_dy:
+                        min_dy = dy
+                        best_dx = dx
+                        
+                # 소재 폭(Strip W) 산출
+                overall_miny = min(miny, miny + min_dy)
+                overall_maxy = max(maxy, maxy + min_dy)
+                strip_w = (overall_maxy - overall_miny) + (margin * 2)
+                
+                # 1피치 안에서 부품 2개가 생산됨
+                util = (pair_area / (p_val * strip_w)) * 100
+                cost = ((((p_val * strip_w * material_thickness) * material_density) / 1000000) * material_price) / 2
+                
+                zigzag_results.append({'각도': f"{angle}°", '피치(mm)': round(p_val,2), '소재폭(mm)': round(strip_w,2), '소재이용율(%)': round(util,2), '1개당 원가(원)': int(cost)})
+                
+                if util > best_z_util:
+                    best_z_util, best_z_cost, best_z_angle = util, cost, angle
+                    best_z_p, best_z_w = p_val, strip_w
+                    best_z_part_a = rot_part
+                    best_z_part_b = translate(rot_part, xoff=best_dx, yoff=min_dy)
 
             # --- [종합 판정] ---
             best_overall_cost = min(best_s_cost, best_i_cost, best_z_cost)
@@ -243,11 +253,11 @@ if uploaded_file is not None:
                 st.caption(f"이용율: :blue[**{best_s_util:.2f}%**] | 단가: :blue[**{int(best_s_cost):,}원**]")
                 fig1, ax1 = plt.subplots(figsize=(6, 6))
                 ax1.plot(*best_s_part.exterior.xy, color='#004b87', linewidth=2); ax1.fill(*best_s_part.exterior.xy, alpha=0.5, color='#004b87')
-                minx, miny, maxx, maxy = best_s_part.bounds
-                ax1.plot([minx, maxx, maxx, minx, minx], [miny, miny, maxy, maxy, miny], color='red', linestyle='--', linewidth=2.5)
+                sx1, sx2 = best_s_part.bounds[0] - bridge/2, best_s_part.bounds[2] + bridge/2
+                sy1, sy2 = best_s_part.bounds[1] - margin, best_s_part.bounds[3] + margin
+                ax1.plot([sx1, sx2, sx2, sx1, sx1], [sy1, sy1, sy2, sy2, sy1], color='red', linestyle='--', linewidth=2.5)
                 ax1.axis('equal'); ax1.set_xticks([]); ax1.set_yticks([])
                 st.pyplot(fig1)
-                
                 df_single = pd.DataFrame(single_results)
                 st.dataframe(df_single.style.apply(lambda r: highlight_best(r, df_single['소재이용율(%)'].max()), axis=1).format(format_dict), use_container_width=True)
 
@@ -258,11 +268,11 @@ if uploaded_file is not None:
                     fig2, ax2 = plt.subplots(figsize=(6, 6))
                     ax2.plot(*best_i_part_a.exterior.xy, color='#004b87', linewidth=2); ax2.fill(*best_i_part_a.exterior.xy, alpha=0.5, color='#004b87')
                     ax2.plot(*best_i_part_b.exterior.xy, color='#007934', linewidth=2); ax2.fill(*best_i_part_b.exterior.xy, alpha=0.5, color='#007934')
-                    minx, miny, maxx, maxy = best_i_pair.bounds
-                    ax2.plot([minx, maxx, maxx, minx, minx], [miny, miny, maxy, maxy, miny], color='red', linestyle='--', linewidth=2.5)
+                    sx1, sx2 = best_i_pair.bounds[0] - bridge/2, best_i_pair.bounds[2] + bridge/2
+                    sy1, sy2 = best_i_pair.bounds[1] - margin, best_i_pair.bounds[3] + margin
+                    ax2.plot([sx1, sx2, sx2, sx1, sx1], [sy1, sy1, sy2, sy2, sy1], color='red', linestyle='--', linewidth=2.5)
                     ax2.axis('equal'); ax2.set_xticks([]); ax2.set_yticks([])
                     st.pyplot(fig2)
-                    
                     df_inter = pd.DataFrame(inter_results)
                     st.dataframe(df_inter.style.apply(lambda r: highlight_best(r, df_inter['소재이용율(%)'].max()), axis=1).format(format_dict), use_container_width=True)
                 else:
@@ -271,15 +281,18 @@ if uploaded_file is not None:
             with col3:
                 st.subheader(f"[3] 지그재그 배열 ({best_z_angle}°)")
                 st.caption(f"이용율: :blue[**{best_z_util:.2f}%**] | 단가: :blue[**{int(best_z_cost):,}원**]")
-                if pair_z_geom:
+                if best_z_part_a is not None:
                     fig3, ax3 = plt.subplots(figsize=(6, 6))
                     ax3.plot(*best_z_part_a.exterior.xy, color='#004b87', linewidth=2); ax3.fill(*best_z_part_a.exterior.xy, alpha=0.5, color='#004b87')
                     ax3.plot(*best_z_part_b.exterior.xy, color='#d55e00', linewidth=2); ax3.fill(*best_z_part_b.exterior.xy, alpha=0.5, color='#d55e00')
-                    minx, miny, maxx, maxy = best_z_pair.bounds
-                    ax3.plot([minx, maxx, maxx, minx, minx], [miny, miny, maxy, maxy, miny], color='red', linestyle='--', linewidth=2.5)
+                    # 정확히 1피치 단위 기준 박스 렌더링
+                    sx1, sx2 = best_z_part_a.bounds[0] - bridge/2, (best_z_part_a.bounds[0] - bridge/2) + best_z_p
+                    overall_miny = min(best_z_part_a.bounds[1], best_z_part_b.bounds[1])
+                    overall_maxy = max(best_z_part_a.bounds[3], best_z_part_b.bounds[3])
+                    sy1, sy2 = overall_miny - margin, overall_maxy + margin
+                    ax3.plot([sx1, sx2, sx2, sx1, sx1], [sy1, sy1, sy2, sy2, sy1], color='red', linestyle='--', linewidth=2.5)
                     ax3.axis('equal'); ax3.set_xticks([]); ax3.set_yticks([])
                     st.pyplot(fig3)
-                    
                     df_zigzag = pd.DataFrame(zigzag_results)
                     st.dataframe(df_zigzag.style.apply(lambda r: highlight_best(r, df_zigzag['소재이용율(%)'].max()), axis=1).format(format_dict), use_container_width=True)
                 else:
@@ -312,8 +325,8 @@ if uploaded_file is not None:
 
             # --- [3] 지그재그 배열 Layout도 ---
             st.divider()
-            st.subheader("◼️ [3] 지그재그 배열 Layout도")
-            if pair_z_geom:
+            st.subheader("◼️ [3] 진정한 다열 지그재그 배열 Layout도")
+            if best_z_part_a is not None:
                 l_val_z = best_z_p * total_stations
                 st.info(f"📐 **지그재그 배열 금형 코어 최소 사이즈:** 가로(L) :blue[**{l_val_z:.1f} mm**] × 세로(W) :blue[**{best_z_w:.1f} mm**]")
                 fig_strip3 = plot_strip_layout([(best_z_part_a, '#004b87'), (best_z_part_b, '#d55e00')], best_z_p, best_z_w, margin, total_stations)
