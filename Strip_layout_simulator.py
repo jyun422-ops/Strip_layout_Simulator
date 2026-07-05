@@ -4,6 +4,8 @@ from ezdxf import path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib as mpl
+import matplotlib.font_manager as fm
 from matplotlib.path import Path as MplPath
 from matplotlib.patches import PathPatch, Circle, Rectangle
 from shapely.geometry import Polygon
@@ -11,6 +13,48 @@ from shapely.affinity import rotate, translate
 from shapely.ops import unary_union
 import tempfile
 import os
+import glob
+
+
+# ============================================================
+# [-1] matplotlib 한글 폰트 자동 설정  ---  ⭐ 개선: Layout도 이미지 내 한글 깨짐(tofu) 방지
+#      리눅스 배포 환경(Streamlit Cloud 등)에는 기본적으로 한글 폰트가 없어
+#      범례/텍스트가 네모 박스로 깨지는 문제를 해결한다.
+# ============================================================
+def setup_korean_font():
+    # 1) OS에 이미 설치되어 있을 수 있는 한글 폰트 이름 후보
+    candidates = ["Malgun Gothic", "AppleGothic", "NanumGothic", "NanumBarunGothic",
+                  "Noto Sans CJK KR", "Noto Sans KR", "UnDotum", "Batang"]
+    available = {f.name for f in fm.fontManager.ttflist}
+    for name in candidates:
+        if name in available:
+            mpl.rcParams['font.family'] = name
+            mpl.rcParams['axes.unicode_minus'] = False
+            return name
+
+    # 2) 시스템에 폰트 파일(.ttf/.otf)이 있는데 matplotlib 캐시에만 없는 경우 직접 스캔
+    search_paths = [
+        "/usr/share/fonts/**/*Nanum*.ttf", "/usr/share/fonts/**/*Nanum*.otf",
+        "/usr/share/fonts/**/*Noto*CJK*.ttc", "/usr/share/fonts/**/*Noto*CJK*.otf",
+        "/usr/share/fonts/**/*malgun*.ttf", "/Library/Fonts/**/*Nanum*.ttf",
+        "./fonts/*.ttf", "./fonts/*.otf",
+    ]
+    for pattern in search_paths:
+        for fpath in glob.glob(pattern, recursive=True):
+            try:
+                fm.fontManager.addfont(fpath)
+                font_name = fm.FontProperties(fname=fpath).get_name()
+                mpl.rcParams['font.family'] = font_name
+                mpl.rcParams['axes.unicode_minus'] = False
+                return font_name
+            except Exception:
+                continue
+
+    mpl.rcParams['axes.unicode_minus'] = False
+    return None
+
+
+KOREAN_FONT_FOUND = setup_korean_font()
 
 # ============================================================
 # [0] DXF 단위 변환 테이블  ---  ⭐ 개선: DXF 단위 자동 인식
@@ -377,6 +421,14 @@ def render_strip_section(label, best, total_stations, margin, carrier_width, pil
 # ============================================================
 st.set_page_config(page_title="프레스 레이아웃 최적화기", layout="wide")
 st.title("⚙️ 프로그레시브 금형 스트립 설계 시뮬레이터")
+
+if KOREAN_FONT_FOUND is None:
+    st.warning(
+        "⚠️ 서버에 한글 폰트가 설치되어 있지 않아 아래 **Layout도 이미지(matplotlib) 안의 한글 텍스트**가 "
+        "네모 박스로 깨져 보일 수 있습니다 (Streamlit UI 텍스트/표는 정상 표시됩니다).\n\n"
+        "Streamlit Community Cloud에 배포한 경우, 저장소 루트에 `packages.txt` 파일을 만들고 "
+        "`fonts-nanum` 한 줄을 추가한 뒤 재배포하면 해결됩니다."
+    )
 
 st.sidebar.header("📝 1. 소재 조건 입력")
 mat_type = st.sidebar.radio("소재 특성 분류", ["일반 철강/연질 (SPCC, AL 등)", "고장력강/경질 (STS, SUS 등)"])
