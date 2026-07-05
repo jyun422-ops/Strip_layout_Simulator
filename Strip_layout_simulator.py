@@ -364,7 +364,8 @@ def render_strip_section(label, best, total_stations, margin, carrier_width, pil
     """2단계 Layout도 1개 섹션(정보+그림)을 렌더링하는 공통 함수."""
     l_val = best['p'] * total_stations
     st.info(f"📐 **{label} 금형 코어 최소 사이즈:** 가로(L) :blue[**{l_val:.1f} mm**] × "
-            f"세로(W) :blue[**{best['w']:.1f} mm**] (캐리어 {carrier_width}mm 포함)")
+            f"세로(W) :blue[**{best['w']:.1f} mm**] (캐리어 {carrier_width}mm 포함)  |  "
+            f"피치(P) :blue[**{best['p']:.2f} mm**] × **{total_stations}**스테이션")
     part_zone = best['w'] - carrier_width * 2
     parts_and_colors = list(zip(best['parts'], colors))
     fig = plot_strip_layout(parts_and_colors, best['p'], part_zone, margin, carrier_width, pilot_dia, total_stations)
