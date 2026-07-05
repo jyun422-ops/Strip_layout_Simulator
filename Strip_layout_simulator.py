@@ -10,124 +10,111 @@ from shapely.ops import unary_union
 import tempfile
 import os
 
-# --- [1] 핵심 알고리즘: 정밀 네스팅 및 피치 계산 ---
-
-def get_true_pitch(part, bridge):
-    """단일 형상 또는 결합된 쌍(Pair)이 가로로 연속 배열될 때의 진짜 최소 피치 계산"""
-    minx, miny, maxx, maxy = part.bounds
+# --- [1] 핵심 알고리즘: 1D 슬라이딩 피치 계산 (형상 파고들기) ---
+def calculate_1d_pitch(geom, bridge):
+    minx, miny, maxx, maxy = geom.bounds
     w = maxx - minx
-    # 조인 스타일(join_style=2, Mitre)을 적용해 코너에서도 브릿지 간격이 좁아지지 않도록 엄격히 보호
-    buffered_part = part.buffer(bridge + 0.05, join_style=2) 
-    
+    buffered_geom = geom.buffer(bridge, resolution=4)
     dx = w + bridge
-    step = w / 20
-    # 1. 먼저 충돌할 때까지 좌측으로 이동
+    step = w / 30
+    
     while dx > 0:
-        test = translate(part, xoff=dx, yoff=0)
-        if buffered_part.intersects(test):
+        test_geom = translate(geom, xoff=dx, yoff=0)
+        if buffered_geom.intersects(test_geom): 
+            dx += step 
             break
         dx -= step
         
-    if dx <= 0: return w + bridge # 예외 처리
-    
-    # 2. 이진 탐색(Binary Search)으로 0.01mm 단위의 완벽한 밀착 지점 찾기
-    low = dx
-    high = dx + step
-    best_dx = high
-    for _ in range(12):
-        mid = (low + high) / 2
-        test = translate(part, xoff=mid, yoff=0)
-        if buffered_part.intersects(test):
-            low = mid # 너무 가까움 (충돌)
-        else:
-            high = mid # 안전함
-            best_dx = mid
-            
-    return best_dx
+    if dx <= 0: dx = step
+        
+    fine_step = step / 10
+    while dx > 0:
+        test_geom = translate(geom, xoff=dx, yoff=0)
+        if buffered_geom.intersects(test_geom): 
+            dx += fine_step 
+            break
+        dx -= fine_step
+        
+    return dx
 
 def find_best_interlock(part, bridge):
-    """180도 교차 배열 시 최적의 상/하 맞물림 위치 찾기"""
     part_b_rotated = rotate(part, 180, origin='centroid')
-    buffered_a = part.buffer(bridge + 0.05, join_style=2)
+    buffered_a = part.buffer(bridge, resolution=4)
     minx, miny, maxx, maxy = part.bounds
     w, h = maxx - minx, maxy - miny
     
-    best_pair_geom, best_part_b = None, None
+    best_pair_geom, best_part_a, best_part_b = None, part, None
     min_box_area = float('inf')
     
-    for dy in np.linspace(-h*0.9, h*0.9, 40):
-        dx = w * 2.0
-        step = w / 20
+    for dy in np.linspace(-h*0.8, h*0.8, 20): 
+        dx = w + bridge
+        step = w / 30 
         while dx > -w:
             test_b = translate(part_b_rotated, xoff=dx, yoff=dy)
-            if buffered_a.intersects(test_b): break
+            if buffered_a.intersects(test_b): dx += step; break
             dx -= step
+        fine_step = step / 10
+        while dx > -w:
+            test_b = translate(part_b_rotated, xoff=dx, yoff=dy)
+            if buffered_a.intersects(test_b): dx += fine_step; break
+            dx -= fine_step
             
-        if dx <= -w: continue
-            
-        low, high = dx, dx + step
-        valid_dx = high
-        for _ in range(10):
-            mid = (low + high) / 2
-            test_b = translate(part_b_rotated, xoff=mid, yoff=dy)
-            if buffered_a.intersects(test_b): low = mid
-            else: high, valid_dx = mid, mid
-                
-        test_b = translate(part_b_rotated, xoff=valid_dx, yoff=dy)
-        pair = unary_union([part, test_b])
-        p_minx, p_miny, p_maxx, p_maxy = pair.bounds
-        box_area = (p_maxx - p_minx) * (p_maxy - p_miny)
-        if box_area < min_box_area:
-            min_box_area, best_pair_geom, best_part_b = box_area, pair, test_b
-                
-    return part, best_part_b, best_pair_geom
+        test_b = translate(part_b_rotated, xoff=dx, yoff=dy)
+        try:
+            pair = unary_union([part, test_b])
+            p_minx, p_miny, p_maxx, p_maxy = pair.bounds
+            box_area = (p_maxx - p_minx) * (p_maxy - p_miny)
+            if box_area < min_box_area:
+                min_box_area, best_pair_geom, best_part_b = box_area, pair, test_b
+        except: continue
+    return best_part_a, best_part_b, best_pair_geom
 
-def find_best_zigzag(part, bridge, p_val):
-    """진정한 다열 지그재그 배열: Row1의 피치를 기준으로 Row2를 최적으로 파고들게 배치"""
-    buffered_a1 = part.buffer(bridge + 0.05, join_style=2)
-    buffered_a2 = translate(buffered_a1, xoff=p_val, yoff=0)
+def find_best_zigzag(part, bridge):
+    part_b_same = part 
+    p_base = calculate_1d_pitch(part, bridge)
+    
+    buffered_a1 = part.buffer(bridge, resolution=4)
+    buffered_a2 = translate(buffered_a1, xoff=p_base, yoff=0)
     
     minx, miny, maxx, maxy = part.bounds
     h = maxy - miny
-    best_pair_geom, best_part_b = None, None
-    best_strip_w = float('inf')
     
-    for dx in np.linspace(0, p_val, 25):
-        dy = h * 1.5
+    best_pair_geom, best_part_a, best_part_b = None, part, None
+    best_dy = float('inf')
+    
+    for dx in np.linspace(0, p_base, 20):
+        dy = h
         step = h / 20
-        # 위에서 아래로 내리면서 Row 1과 충돌하는 지점 탐색
-        while dy > -h:
-            test_b = translate(part, xoff=dx, yoff=dy)
-            if buffered_a1.intersects(test_b) or buffered_a2.intersects(test_b): break
+        test_b = translate(part_b_same, xoff=dx, yoff=dy)
+        while not (buffered_a1.intersects(test_b) or buffered_a2.intersects(test_b)):
             dy -= step
+            if dy < -h*1.5: break
+            test_b = translate(part_b_same, xoff=dx, yoff=dy)
         
-        if dy <= -h: continue
-            
-        low, high = dy, dy + step
-        valid_dy = high
-        for _ in range(10):
-            mid = (low + high) / 2
-            test_b = translate(part, xoff=dx, yoff=mid)
-            if buffered_a1.intersects(test_b) or buffered_a2.intersects(test_b): low = mid
-            else: high, valid_dy = mid, mid
+        dy += step
+        fine_step = step / 10
+        test_b = translate(part_b_same, xoff=dx, yoff=dy)
+        while not (buffered_a1.intersects(test_b) or buffered_a2.intersects(test_b)):
+            dy -= fine_step
+            if dy < -h*1.5: break
+            test_b = translate(part_b_same, xoff=dx, yoff=dy)
+        dy += fine_step
         
-        overall_miny = min(miny, miny + valid_dy)
-        overall_maxy = max(maxy, maxy + valid_dy)
-        strip_w = overall_maxy - overall_miny
-        
-        if strip_w < best_strip_w:
-            best_strip_w = strip_w
-            best_part_b = translate(part, xoff=dx, yoff=valid_dy)
+        if dy < best_dy:
+            best_dy = dy
+            best_part_b = translate(part_b_same, xoff=dx, yoff=dy)
             
     if best_part_b:
-        best_pair_geom = unary_union([part, best_part_b])
+        try:
+            best_pair_geom = unary_union([best_part_a, best_part_b])
+        except: pass
         
-    return part, best_part_b, best_pair_geom
+    return best_part_a, best_part_b, best_pair_geom
 
-# --- [도면 렌더링 함수] ---
+# --- [2] 스트립 Layout도 렌더링 함수 ---
 def plot_strip_layout(parts_and_colors, pitch, strip_width, margin, total_stations):
     fig, ax = plt.subplots(figsize=(max(8, total_stations * 2), 3.5))
-    total_length = pitch * total_stations + margin
+    total_length = pitch * total_stations
     
     ax.plot([0, total_length, total_length, 0, 0], [0, 0, strip_width, strip_width, 0], 
             color='red', linestyle='-', linewidth=2.5, 
@@ -136,8 +123,8 @@ def plot_strip_layout(parts_and_colors, pitch, strip_width, margin, total_statio
     all_geoms = unary_union([p[0] for p in parts_and_colors])
     minx, miny, maxx, maxy = all_geoms.bounds
     
-    x_offset = -minx + margin
     y_offset = -miny + margin
+    x_offset = -minx + (pitch * 0.2) 
     
     for i in range(total_stations):
         for geom, color in parts_and_colors:
@@ -146,7 +133,7 @@ def plot_strip_layout(parts_and_colors, pitch, strip_width, margin, total_statio
             ax.fill(*shifted.exterior.xy, alpha=0.5, color=color)
         
         if i < total_stations - 1:
-            ax.plot([margin + pitch * (i+1), margin + pitch * (i+1)], [0, strip_width], color='black', linestyle=':', alpha=0.4)
+            ax.plot([pitch * (i+1), pitch * (i+1)], [0, strip_width], color='black', linestyle=':', alpha=0.4)
             
     ax.axis('equal')
     ax.set_xticks([])
@@ -156,7 +143,7 @@ def plot_strip_layout(parts_and_colors, pitch, strip_width, margin, total_statio
     return fig
 
 
-# --- [2] 웹사이트 화면 및 메뉴 구성 ---
+# --- [3] 웹사이트 화면 및 메뉴 구성 ---
 st.set_page_config(page_title="프레스 레이아웃 최적화기", layout="wide")
 st.title("⚙️ 프로그레시브 금형 스트립 설계 시뮬레이터")
 
@@ -166,7 +153,6 @@ material_thickness = st.sidebar.number_input("소재 두께 (t)", value=1.2, ste
 material_price = st.sidebar.number_input("단가 (원/kg)", value=1200, step=50)
 material_density = st.sidebar.number_input("비중", value=7.85, step=0.01)
 
-# 자동 추천 브릿지 로직
 if "일반" in mat_type:
     rec_bridge = max(1.2, 1.2 * material_thickness)
     rec_margin = max(1.5, 1.5 * material_thickness)
@@ -175,7 +161,6 @@ else:
     rec_margin = max(2.0, 1.8 * material_thickness)
 
 st.sidebar.header("📏 2. 배열 간격 (다이 강도 고려)")
-st.sidebar.caption("소재 두께를 기반으로 다이 파손을 막는 권장 최소값이 자동 세팅됩니다. 필요시 수정하세요.")
 bridge = st.sidebar.number_input("최소 브릿지 (mm)", value=float(round(rec_bridge, 1)), step=0.1)
 margin = st.sidebar.number_input("가장자리 마진 (mm)", value=float(round(rec_margin, 1)), step=0.1)
 
@@ -191,11 +176,11 @@ total_stations = max(1, int((st_notch + st_pierce + st_form + st_blank + st_idle
 st.sidebar.info(f"**총 예상 스테이션: {total_stations} 피치**")
 
 
-# --- [3] 메인 화면 동작 로직 ---
+# --- [4] 메인 화면 동작 로직 ---
 uploaded_file = st.file_uploader("DXF 전개도면을 업로드하세요.", type=['dxf'])
 
 if uploaded_file is not None:
-    with st.spinner('다이 강도를 고려한 정밀 네스팅(Nesting) 최적화를 진행 중입니다... (약 15초 소요)'):
+    with st.spinner('안전 간격 적용 및 3가지 배열의 정밀 형상 맞춤(Nesting)을 분석 중입니다... (약 15초 소요)'):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp:
             tmp.write(uploaded_file.getvalue())
             tmp_path = tmp.name
@@ -220,13 +205,13 @@ if uploaded_file is not None:
             if part.geom_type == 'MultiPolygon': part = max(part.geoms, key=lambda a: a.area)
             part_area, pair_area = part.area, part.area * 2 
             
-            # --- [Case 1] 단일 배열 ---
+            # --- [Case 1] 단일 배열 (1D Nesting 적용) ---
             single_results = []
             best_s_util, best_s_cost, best_s_angle, best_s_part = 0, float('inf'), 0, None
             best_s_w, best_s_p = 0, 0
             for angle in range(0, 180, 10):
                 rot = rotate(part, angle, origin='center')
-                p_val = get_true_pitch(rot, bridge) # 진짜 피치 계산 적용!
+                p_val = calculate_1d_pitch(rot, bridge)
                 minx, miny, maxx, maxy = rot.bounds
                 w_val = (maxy - miny) + (margin * 2)
                 util = (part_area / (p_val * w_val)) * 100
@@ -234,7 +219,7 @@ if uploaded_file is not None:
                 single_results.append({'각도': f"{angle}°", '피치(mm)': round(p_val,2), '소재폭(mm)': round(w_val,2), '소재이용율(%)': round(util,2), '1개당 원가(원)': int(cost)})
                 if util > best_s_util: best_s_util, best_s_cost, best_s_angle, best_s_part, best_s_w, best_s_p = util, cost, angle, rot, w_val, p_val
 
-            # --- [Case 2] 180도 교차 배열 ---
+            # --- [Case 2] 180도 교차 배열 (1D Nesting 적용) ---
             part_i_a, part_i_b, pair_i_geom = find_best_interlock(part, bridge)
             inter_results = []
             best_i_util, best_i_cost, best_i_angle, best_i_pair = 0, float('inf'), 0, None
@@ -245,7 +230,7 @@ if uploaded_file is not None:
                     rot_a = rotate(part_i_a, angle, origin=pair_i_geom.centroid)
                     rot_b = rotate(part_i_b, angle, origin=pair_i_geom.centroid)
                     rot_pair = unary_union([rot_a, rot_b])
-                    p_val = get_true_pitch(rot_pair, bridge) # 쌍 단위 진짜 피치 계산 적용!
+                    p_val = calculate_1d_pitch(rot_pair, bridge)
                     minx, miny, maxx, maxy = rot_pair.bounds
                     w_val = (maxy - miny) + (margin * 2)
                     util = (pair_area / (p_val * w_val)) * 100
@@ -255,27 +240,26 @@ if uploaded_file is not None:
                         best_i_util, best_i_cost, best_i_angle, best_i_pair, best_i_w, best_i_p = util, cost, angle, rot_pair, w_val, p_val
                         best_i_part_a, best_i_part_b = rot_a, rot_b
 
-            # --- [Case 3] 지그재그 배열 ---
+            # --- [Case 3] 다열 지그재그 배열 (1D Nesting 적용) ---
+            part_z_a, part_z_b, pair_z_geom = find_best_zigzag(part, bridge)
             zigzag_results = []
-            best_z_util, best_z_cost, best_z_angle = 0, float('inf'), 0
-            best_z_part_a, best_z_part_b, best_z_pair = None, None, None
+            best_z_util, best_z_cost, best_z_angle, best_z_pair = 0, float('inf'), 0, None
+            best_z_part_a, best_z_part_b = None, None
             best_z_w, best_z_p = 0, 0
-            
-            for angle in range(0, 180, 10):
-                rot = rotate(part, angle, origin='center')
-                p_val_single = get_true_pitch(rot, bridge) # 단일열 피치를 먼저 계산
-                rot_z_a, rot_z_b, rot_pair = find_best_zigzag(rot, bridge, p_val_single)
-                if rot_pair:
-                    p_val = p_val_single # 지그재그 진행 피치는 단일열 피치와 동일
+            if pair_z_geom:
+                for angle in range(0, 180, 10):
+                    rot_a = rotate(part_z_a, angle, origin=pair_z_geom.centroid)
+                    rot_b = rotate(part_z_b, angle, origin=pair_z_geom.centroid)
+                    rot_pair = unary_union([rot_a, rot_b])
+                    p_val = calculate_1d_pitch(rot_pair, bridge)
                     minx, miny, maxx, maxy = rot_pair.bounds
                     w_val = (maxy - miny) + (margin * 2)
                     util = (pair_area / (p_val * w_val)) * 100
                     cost = ((((p_val * w_val * material_thickness) * material_density) / 1000000) * material_price) / 2
                     zigzag_results.append({'각도': f"{angle}°", '피치(mm)': round(p_val,2), '소재폭(mm)': round(w_val,2), '소재이용율(%)': round(util,2), '1개당 원가(원)': int(cost)})
-                    if util > best_z_util:
-                        best_z_util, best_z_cost, best_z_angle = util, cost, angle
-                        best_z_p, best_z_w = p_val, w_val
-                        best_z_part_a, best_z_part_b, best_z_pair = rot_z_a, rot_z_b, rot_pair
+                    if util > best_z_util: 
+                        best_z_util, best_z_cost, best_z_angle, best_z_pair, best_z_w, best_z_p = util, cost, angle, rot_pair, w_val, p_val
+                        best_z_part_a, best_z_part_b = rot_a, rot_b
 
             # --- [종합 판정] ---
             best_overall_cost = min(best_s_cost, best_i_cost, best_z_cost)
@@ -301,9 +285,10 @@ if uploaded_file is not None:
                 st.caption(f"이용율: :blue[**{best_s_util:.2f}%**] | 단가: :blue[**{int(best_s_cost):,}원**]")
                 fig1, ax1 = plt.subplots(figsize=(6, 6))
                 ax1.plot(*best_s_part.exterior.xy, color='#004b87', linewidth=2); ax1.fill(*best_s_part.exterior.xy, alpha=0.5, color='#004b87')
-                sx1, sx2 = best_s_part.bounds[0] - bridge/2, (best_s_part.bounds[0] - bridge/2) + best_s_p
+                sx1 = best_s_part.bounds[0]
                 sy1, sy2 = best_s_part.bounds[1] - margin, best_s_part.bounds[3] + margin
-                ax1.plot([sx1, sx2, sx2, sx1, sx1], [sy1, sy1, sy2, sy2, sy1], color='red', linestyle='--', linewidth=2.5)
+                # 단위 피치(Unit Pitch) 경계선 시각화
+                ax1.plot([sx1, sx1+best_s_p, sx1+best_s_p, sx1, sx1], [sy1, sy1, sy2, sy2, sy1], color='red', linestyle='--', linewidth=2.5)
                 ax1.axis('equal'); ax1.set_xticks([]); ax1.set_yticks([])
                 st.pyplot(fig1)
                 df_single = pd.DataFrame(single_results)
@@ -316,9 +301,9 @@ if uploaded_file is not None:
                     fig2, ax2 = plt.subplots(figsize=(6, 6))
                     ax2.plot(*best_i_part_a.exterior.xy, color='#004b87', linewidth=2); ax2.fill(*best_i_part_a.exterior.xy, alpha=0.5, color='#004b87')
                     ax2.plot(*best_i_part_b.exterior.xy, color='#007934', linewidth=2); ax2.fill(*best_i_part_b.exterior.xy, alpha=0.5, color='#007934')
-                    sx1, sx2 = best_i_pair.bounds[0] - bridge/2, (best_i_pair.bounds[0] - bridge/2) + best_i_p
+                    sx1 = best_i_pair.bounds[0]
                     sy1, sy2 = best_i_pair.bounds[1] - margin, best_i_pair.bounds[3] + margin
-                    ax2.plot([sx1, sx2, sx2, sx1, sx1], [sy1, sy1, sy2, sy2, sy1], color='red', linestyle='--', linewidth=2.5)
+                    ax2.plot([sx1, sx1+best_i_p, sx1+best_i_p, sx1, sx1], [sy1, sy1, sy2, sy2, sy1], color='red', linestyle='--', linewidth=2.5)
                     ax2.axis('equal'); ax2.set_xticks([]); ax2.set_yticks([])
                     st.pyplot(fig2)
                     df_inter = pd.DataFrame(inter_results)
@@ -333,9 +318,9 @@ if uploaded_file is not None:
                     fig3, ax3 = plt.subplots(figsize=(6, 6))
                     ax3.plot(*best_z_part_a.exterior.xy, color='#004b87', linewidth=2); ax3.fill(*best_z_part_a.exterior.xy, alpha=0.5, color='#004b87')
                     ax3.plot(*best_z_part_b.exterior.xy, color='#d55e00', linewidth=2); ax3.fill(*best_z_part_b.exterior.xy, alpha=0.5, color='#d55e00')
-                    sx1, sx2 = best_z_part_a.bounds[0] - bridge/2, (best_z_part_a.bounds[0] - bridge/2) + best_z_p
+                    sx1 = best_z_pair.bounds[0]
                     sy1, sy2 = best_z_pair.bounds[1] - margin, best_z_pair.bounds[3] + margin
-                    ax3.plot([sx1, sx2, sx2, sx1, sx1], [sy1, sy1, sy2, sy2, sy1], color='red', linestyle='--', linewidth=2.5)
+                    ax3.plot([sx1, sx1+best_z_p, sx1+best_z_p, sx1, sx1], [sy1, sy1, sy2, sy2, sy1], color='red', linestyle='--', linewidth=2.5)
                     ax3.axis('equal'); ax3.set_xticks([]); ax3.set_yticks([])
                     st.pyplot(fig3)
                     df_zigzag = pd.DataFrame(zigzag_results)
@@ -348,33 +333,26 @@ if uploaded_file is not None:
             # ==========================================
             st.divider()
             st.header("🎞️ [2단계] 스트립 Layout도 및 금형 코어 사이즈 도출")
-            st.markdown(f"좌측에서 설정한 **안전 브릿지({bridge}mm)**와 **마진({margin}mm)**이 완벽하게 적용된 1:1 비율 도면입니다.")
+            st.markdown(f"좌측에서 입력하신 **총 {total_stations} 피치**를 기준으로 한 실제 금형 내부 작업 구간의 설계 도면입니다.")
             
-            # --- [1] 단일 배열 Layout도 ---
             st.subheader("◼️ [1] 단일 배열 Layout도")
-            l_val_s = best_s_p * total_stations + margin
+            l_val_s = best_s_p * total_stations
             st.info(f"📐 **단일 배열 금형 코어 최소 사이즈:** 가로(L) :blue[**{l_val_s:.1f} mm**] × 세로(W) :blue[**{best_s_w:.1f} mm**]")
             fig_strip1 = plot_strip_layout([(best_s_part, '#004b87')], best_s_p, best_s_w, margin, total_stations)
             st.pyplot(fig_strip1)
 
-            # --- [2] 180도 교차 배열 Layout도 ---
             st.divider()
             st.subheader("◼️ [2] 180도 교차 배열 Layout도")
             if pair_i_geom:
-                l_val_i = best_i_p * total_stations + margin
+                l_val_i = best_i_p * total_stations
                 st.info(f"📐 **180도 교차 배열 금형 코어 최소 사이즈:** 가로(L) :blue[**{l_val_i:.1f} mm**] × 세로(W) :blue[**{best_i_w:.1f} mm**]")
                 fig_strip2 = plot_strip_layout([(best_i_part_a, '#004b87'), (best_i_part_b, '#007934')], best_i_p, best_i_w, margin, total_stations)
                 st.pyplot(fig_strip2)
-            else:
-                st.warning("이 부품은 180도 교차 배열이 불가능합니다.")
 
-            # --- [3] 지그재그 배열 Layout도 ---
             st.divider()
             st.subheader("◼️ [3] 지그재그 배열 Layout도")
-            if best_z_pair is not None:
-                l_val_z = best_z_p * total_stations + margin
+            if best_z_part_a is not None:
+                l_val_z = best_z_p * total_stations
                 st.info(f"📐 **지그재그 배열 금형 코어 최소 사이즈:** 가로(L) :blue[**{l_val_z:.1f} mm**] × 세로(W) :blue[**{best_z_w:.1f} mm**]")
                 fig_strip3 = plot_strip_layout([(best_z_part_a, '#004b87'), (best_z_part_b, '#d55e00')], best_z_p, best_z_w, margin, total_stations)
                 st.pyplot(fig_strip3)
-            else:
-                st.warning("이 부품은 지그재그 배열이 불가능합니다.")
