@@ -17,12 +17,9 @@ import glob
 
 
 # ============================================================
-# [-1] matplotlib 한글 폰트 자동 설정  ---  ⭐ 개선: Layout도 이미지 내 한글 깨짐(tofu) 방지
-#      리눅스 배포 환경(Streamlit Cloud 등)에는 기본적으로 한글 폰트가 없어
-#      범례/텍스트가 네모 박스로 깨지는 문제를 해결한다.
+# [-1] matplotlib 한글 폰트 자동 설정
 # ============================================================
 def setup_korean_font():
-    # 1) OS에 이미 설치되어 있을 수 있는 한글 폰트 이름 후보
     candidates = ["Malgun Gothic", "AppleGothic", "NanumGothic", "NanumBarunGothic",
                   "Noto Sans CJK KR", "Noto Sans KR", "UnDotum", "Batang"]
     available = {f.name for f in fm.fontManager.ttflist}
@@ -32,7 +29,6 @@ def setup_korean_font():
             mpl.rcParams['axes.unicode_minus'] = False
             return name
 
-    # 2) 시스템에 폰트 파일(.ttf/.otf)이 있는데 matplotlib 캐시에만 없는 경우 직접 스캔
     search_paths = [
         "/usr/share/fonts/**/*Nanum*.ttf", "/usr/share/fonts/**/*Nanum*.otf",
         "/usr/share/fonts/**/*Noto*CJK*.ttc", "/usr/share/fonts/**/*Noto*CJK*.otf",
@@ -57,30 +53,28 @@ def setup_korean_font():
 KOREAN_FONT_FOUND = setup_korean_font()
 
 # ============================================================
-# [0] DXF 단위 변환 테이블  ---  ⭐ 개선: DXF 단위 자동 인식
+# [0] DXF 단위 변환 테이블
 # ============================================================
-# ezdxf 표준 $INSUNITS 코드 → mm 환산 계수
 INSUNITS_TO_MM = {
-    0: None,      # Unitless -> 알 수 없음. mm으로 간주하되 사용자에게 경고
-    1: 25.4,      # Inches
-    2: 304.8,     # Feet
-    3: 1609344.0, # Miles (거의 안 쓰임)
-    4: 1.0,       # Millimeters
-    5: 10.0,      # Centimeters
-    6: 1000.0,    # Meters
-    13: 100.0,    # Decimeters
+    0: None,      
+    1: 25.4,      
+    2: 304.8,     
+    3: 1609344.0, 
+    4: 1.0,       
+    5: 10.0,      
+    6: 1000.0,    
+    13: 100.0,    
 }
 
 
 def get_unit_factor(doc):
-    """도면 헤더의 $INSUNITS 값을 읽어 mm 환산 계수와 안내 메시지를 반환."""
     try:
         code = doc.header.get('$INSUNITS', 0)
     except Exception:
         code = 0
     factor = INSUNITS_TO_MM.get(code, None)
     if factor is None:
-        return 1.0, f"⚠️ 도면에 단위 정보($INSUNITS={code})가 없거나 인식할 수 없어 **mm으로 간주**하고 계산합니다. 실제 단위가 다르면 결과가 부정확할 수 있습니다."
+        return 1.0, f"⚠️ 도면에 단위 정보($INSUNITS={code})가 없거나 인식할 수 없어 **mm으로 간주**하고 계산합니다."
     if factor == 1.0:
         return 1.0, "✅ 도면 단위: mm (변환 불필요)"
     return factor, f"✅ 도면 단위 자동 인식: 환산 계수 ×{factor} 적용하여 mm로 변환했습니다."
@@ -90,12 +84,6 @@ def get_unit_factor(doc):
 # [1] 핵심 알고리즘: 1D 슬라이딩 피치 계산 (형상 파고들기 + 반복 주기 검증)
 # ============================================================
 def calculate_1d_pitch(geom, bridge):
-    """
-    geom(단일 부품 또는 부품 쌍 전체)을 x축으로 무한 반복 배열했을 때
-    자기 자신과 충돌하지 않는 최소 피치를 계산.
-    buffered_geom.intersects(translate(geom, dx))로 '한 피치 옆의 나(=다음 스테이션)'와
-    현재 형상이 겹치는지 검사하므로, 반복 배열 시 발생하는 간섭까지 자동으로 걸러진다.
-    """
     minx, miny, maxx, maxy = geom.bounds
     w = maxx - minx
     buffered_geom = geom.buffer(bridge, resolution=4)
@@ -211,11 +199,6 @@ def find_best_zigzag(part, bridge):
 # [2] DXF 읽기: 단위 변환 + 외곽선 + 내측 홀(피어싱) 인식
 # ============================================================
 def read_part_with_holes(msp, unit_factor):
-    """
-    도면 안의 모든 닫힌 폴리라인을 unit_factor로 mm 스케일 변환하며 읽어들여서,
-    면적이 가장 큰 도형 = 외곽선, 나머지 중 외곽선 내부에 포함되는 도형 = 내측 홀로 분류한다.
-    반환: (외곽 shapely Polygon(홀 포함), 홀 Polygon 리스트)
-    """
     candidates = []
     flatten_tol = 0.1 if unit_factor == 0 else max(1e-4, 0.05 / unit_factor)
     for entity in msp.query('LWPOLYLINE POLYLINE'):
@@ -253,7 +236,6 @@ def read_part_with_holes(msp, unit_factor):
 
 
 def plot_polygon(ax, poly, color, lw=1.5, alpha=0.5):
-    """홀이 있는 shapely Polygon을 올바르게(구멍이 뚫린 채로) 렌더링."""
     ext = np.array(poly.exterior.coords)
     verts = ext.tolist()
     codes = [MplPath.MOVETO] + [MplPath.LINETO] * (len(ext) - 2) + [MplPath.CLOSEPOLY]
@@ -270,17 +252,11 @@ def plot_polygon(ax, poly, color, lw=1.5, alpha=0.5):
 
 
 # ============================================================
-# [3] 배열 각도 스캔 공통 로직  ---  ⭐ 리팩터링: 3개 케이스 중복 제거
-#     + 압연방향(그레인) 제약 반영
+# [3] 배열 각도 스캔 공통 로직
 # ============================================================
 def analyze_case(base_parts, origin, area_for_util, cost_divisor, bridge, margin, carrier_width,
                   material_thickness, material_density, material_price,
                   check_rolling, bend_line_angle, min_angle_from_rolling):
-    """
-    base_parts : 회전 원점(angle=0) 기준 부품 geometry 리스트 (단일배열=1개, 교차/지그재그=2개)
-    origin     : shapely rotate()에 사용할 회전 기준점 ('center' 또는 pair.centroid 등)
-    반환: (각도별 결과 테이블 rows, 최적 조합 dict, 제약 무시 여부)
-    """
     results = []
     best, fallback_best = None, None
 
@@ -294,7 +270,6 @@ def analyze_case(base_parts, origin, area_for_util, cost_divisor, bridge, margin
         util = (area_for_util / (p_val * w_val)) * 100
         cost = (((p_val * w_val * material_thickness) * material_density) / 1_000_000) * material_price / cost_divisor
 
-        # --- 압연방향(그레인) 제약: 벤딩 라인이 압연방향(X축=프레스 진행방향)과 너무 평행하면 부적합 ---
         valid = True
         if check_rolling:
             eff_angle = (bend_line_angle + angle) % 180
@@ -320,7 +295,6 @@ def analyze_case(base_parts, origin, area_for_util, cost_divisor, bridge, margin
 
 
 def render_case_column(col, label, results, best, used_fallback, colors, margin, carrier_width):
-    """단위 배열 결과 1개 컬럼(그림+표)을 렌더링하는 공통 함수."""
     with col:
         st.subheader(f"{label} ({best['angle']}°)")
         st.caption(f"이용율: :blue[**{best['util']:.2f}%**] | 단가: :blue[**{int(best['cost']):,}원**]")
@@ -361,8 +335,16 @@ def render_case_column(col, label, results, best, used_fallback, colors, margin,
 def plot_strip_layout(parts_and_colors, pitch, part_zone_width, margin, carrier_width,
                        pilot_dia, total_stations):
     strip_width = part_zone_width + carrier_width * 2
+    
+    # ⭐ 수정: 부품 1개의 실제 가로(X) 길이를 추출하여 금형 코어 길이에 반영
+    all_geoms = unary_union([p[0] for p in parts_and_colors])
+    minx, miny, maxx, maxy = all_geoms.bounds
+    part_length = maxx - minx
+    
+    # ⭐ 수정: 마지막 스테이션 부품 전체를 덮을 수 있도록 총 길이 계산식 보완
+    total_length = (pitch * (total_stations - 1)) + part_length + (pitch * 0.4)
+
     fig, ax = plt.subplots(figsize=(max(8, total_stations * 2), 4))
-    total_length = pitch * total_stations
 
     ax.plot([0, total_length, total_length, 0, 0], [0, 0, strip_width, strip_width, 0],
             color='red', linestyle='-', linewidth=2.5,
@@ -374,9 +356,6 @@ def plot_strip_layout(parts_and_colors, pitch, part_zone_width, margin, carrier_
         ax.add_patch(Rectangle((0, strip_width - carrier_width), total_length, carrier_width,
                                 facecolor='#999999', alpha=0.25, edgecolor='none',
                                 label='캐리어(스켈레톤) 영역'))
-
-    all_geoms = unary_union([p[0] for p in parts_and_colors])
-    minx, miny, maxx, maxy = all_geoms.bounds
 
     y_offset = -miny + margin + carrier_width
     x_offset = -minx + (pitch * 0.2)
@@ -405,11 +384,17 @@ def plot_strip_layout(parts_and_colors, pitch, part_zone_width, margin, carrier_
 
 
 def render_strip_section(label, best, total_stations, margin, carrier_width, pilot_dia, colors):
-    """2단계 Layout도 1개 섹션(정보+그림)을 렌더링하는 공통 함수."""
-    l_val = best['p'] * total_stations
+    # ⭐ 수정: 텍스트에 표기되는 가로(L) 길이에도 동일한 산출 공식 적용
+    all_geoms = best['parts'][0] if len(best['parts']) == 1 else unary_union(best['parts'])
+    minx, miny, maxx, maxy = all_geoms.bounds
+    part_length = maxx - minx
+    
+    l_val = (best['p'] * (total_stations - 1)) + part_length + (best['p'] * 0.4)
+    
     st.info(f"📐 **{label} 금형 코어 최소 사이즈:** 가로(L) :blue[**{l_val:.1f} mm**] × "
             f"세로(W) :blue[**{best['w']:.1f} mm**] (캐리어 {carrier_width}mm 포함)  |  "
             f"피치(P) :blue[**{best['p']:.2f} mm**] × **{total_stations}**스테이션")
+            
     part_zone = best['w'] - carrier_width * 2
     parts_and_colors = list(zip(best['parts'], colors))
     fig = plot_strip_layout(parts_and_colors, best['p'], part_zone, margin, carrier_width, pilot_dia, total_stations)
@@ -502,7 +487,7 @@ if uploaded_file is not None:
             if part.geom_type == 'MultiPolygon':
                 part = max(part.geoms, key=lambda a: a.area)
 
-            part_area, pair_area = part.area, part.area * 2  # 홀이 반영된 순단면적
+            part_area, pair_area = part.area, part.area * 2  
 
             if holes:
                 hole_area_sum = sum(h.area for h in holes)
