@@ -280,7 +280,7 @@ def render_case_column(col, label, results, best, used_fallback, colors, margin,
 
 
 # ============================================================
-# [4] 스트립 Layout도 렌더링 및 DXF Export (우선순위 2)
+# [4] 스트립 Layout도 렌더링 및 DXF Export
 # ============================================================
 def plot_strip_layout(parts_and_colors, pitch, part_zone_width, margin, carrier_width, pilot_dia, total_stations):
     strip_width = part_zone_width + carrier_width * 2
@@ -331,18 +331,15 @@ def render_strip_section(label, best, total_stations, margin, carrier_width, pil
     fig = plot_strip_layout(list(zip(best['parts'], colors)), best['p'], part_zone, margin, carrier_width, pilot_dia, total_stations)
     st.pyplot(fig)
 
-# ⭐ DXF Export를 위한 Shapely Polygon -> DXF 변환 로직
-def generate_dxf_bytes(tuned_parts, tune_pitch, tune_width, total_stations, margin, carrier_width, pilot_dia, y_shift):
-    """미세 조정이 끝난 최종 배열 데이터를 CAD DXF 파일 포맷으로 변환하여 바이트 스트림으로 반환합니다."""
+# ⭐ 수정된 DXF Export 함수 (x_shift 반영)
+def generate_dxf_bytes(tuned_parts, tune_pitch, tune_width, total_stations, margin, carrier_width, pilot_dia, x_shift, y_shift):
     doc = ezdxf.new('R2010')
     msp = doc.modelspace()
     
-    # 레이어 및 색상 설정
-    doc.layers.add("STRIP_EDGE", color=1)      # 빨간색 (외곽 가이드라인)
-    doc.layers.add("PARTS", color=7)           # 흰색/검정색 (제품 형상)
-    doc.layers.add("PILOT_HOLES", color=5)     # 파란색 (파일럿 홀)
+    doc.layers.add("STRIP_EDGE", color=1)
+    doc.layers.add("PARTS", color=7)
+    doc.layers.add("PILOT_HOLES", color=5)
 
-    # 1. 스트립 외곽 가이드라인 렌더링
     all_geom_tuned = tuned_parts[0] if len(tuned_parts) == 1 else unary_union(tuned_parts)
     minx, miny, maxx, maxy = all_geom_tuned.bounds
     part_length_tuned = maxx - minx
@@ -351,36 +348,30 @@ def generate_dxf_bytes(tuned_parts, tune_pitch, tune_width, total_stations, marg
     msp.add_lwpolyline([(0, 0), (total_length_tuned, 0)], dxfattribs={'layer': 'STRIP_EDGE'})
     msp.add_lwpolyline([(0, tune_width), (total_length_tuned, tune_width)], dxfattribs={'layer': 'STRIP_EDGE'})
     
-    # Shapely Polygon을 DXF 객체로 추가하는 헬퍼 함수
     def add_poly_to_msp(poly, layer_name):
         if poly.geom_type == 'MultiPolygon':
             for p in poly.geoms:
                 add_poly_to_msp(p, layer_name)
             return
         
-        # 제품 외곽선 (Exterior)
         ext_coords = list(poly.exterior.coords)
         msp.add_lwpolyline(ext_coords, dxfattribs={'layer': layer_name, 'closed': True})
         
-        # 제품 내측 홀 (Interiors)
         for interior in poly.interiors:
             int_coords = list(interior.coords)
             msp.add_lwpolyline(int_coords, dxfattribs={'layer': layer_name, 'closed': True})
 
-    # 2. 각 스테이션별 부품 및 파일럿 홀 배치
     for i in range(total_stations):
-        # 부품 형상 평행이동 후 DXF에 삽입
         for geom in tuned_parts:
-            shifted = translate(geom, xoff=(i * tune_pitch), yoff=y_shift)
+            # ⭐ 수정됨: 부품의 X, Y 좌표를 붉은색 외곽선 박스 안으로 정렬
+            shifted = translate(geom, xoff=x_shift + (i * tune_pitch), yoff=y_shift)
             add_poly_to_msp(shifted, "PARTS")
 
-        # 파일럿 홀 삽입
         if carrier_width > 0 and 0 < pilot_dia < carrier_width:
             cx = tune_pitch * (i + 0.5)
             cy = carrier_width / 2
             msp.add_circle(center=(cx, cy), radius=pilot_dia / 2, dxfattribs={'layer': 'PILOT_HOLES'})
 
-    # 임시 파일로 저장 후 바이트 데이터 반환
     with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp:
         doc.saveas(tmp.name)
         tmp_path = tmp.name
@@ -606,12 +597,17 @@ if uploaded_file is not None:
     minx, miny, maxx, maxy = all_geom_tuned.bounds
     part_length_tuned = maxx - minx
     total_length_tuned = (tune_pitch * (total_stations - 1)) + part_length_tuned + (tune_pitch * 0.4)
+    
+    # ⭐ 수정됨: 부품을 붉은색 외곽선(0점 시작) 박스 안으로 정렬시키는 X/Y 보정값
+    x_shift = -minx + (tune_pitch * 0.2)
     y_shift = -miny + margin + carrier_width
 
     fig_tune, ax_tune = plt.subplots(figsize=(max(8, total_stations * 2), 4))
+    
+    # ⭐ 수정됨: 범례(Label)에 피치(Pitch) 사이즈 추가
     ax_tune.plot([0, total_length_tuned, total_length_tuned, 0, 0], 
                  [0, 0, tune_width, tune_width, 0], color='red', linestyle='-', linewidth=2.5,
-                 label=f'조정 후 코어 사이즈\n(가로: {total_length_tuned:.1f} x 세로: {tune_width:.1f})')
+                 label=f'조정 후 코어 사이즈\n(가로: {total_length_tuned:.1f} x 세로: {tune_width:.1f} | 피치: {tune_pitch:.2f})')
     
     if carrier_width > 0:
         ax_tune.add_patch(Rectangle((0, 0), total_length_tuned, carrier_width, facecolor='#999999', alpha=0.25, edgecolor='none'))
@@ -621,7 +617,9 @@ if uploaded_file is not None:
         for idx, geom in enumerate(tuned_parts):
             color = ['#004b87', '#007934'][idx] if is_pair else '#004b87'
             if tune_target_name == '지그재그 배열': color = ['#004b87', '#d55e00'][idx]
-            shifted = translate(geom, xoff=(i * tune_pitch), yoff=y_shift)
+            
+            # ⭐ 수정됨: x_shift 적용하여 붉은 박스 내부에 정확히 안착
+            shifted = translate(geom, xoff=x_shift + (i * tune_pitch), yoff=y_shift)
             plot_polygon(ax_tune, shifted, color, lw=1.5, alpha=0.7)
 
         if carrier_width > 0 and 0 < pilot_dia < carrier_width:
@@ -640,7 +638,6 @@ if uploaded_file is not None:
     st.subheader("💾 [4단계] CAD 도면(DXF) 내보내기")
     st.markdown("위에서 미세조정을 마친 최종 배열을 CAD(AutoCAD 등)에서 바로 작업할 수 있도록 **DXF 파일로 다운로드**합니다. 레이어 분리(외곽선/제품/파일럿홀)가 적용되어 있어 실무 설계에 즉시 활용 가능합니다.")
     
-    # Export 버튼을 누를 때마다 백그라운드에서 DXF Byte를 즉시 생성
     dxf_bytes = generate_dxf_bytes(
         tuned_parts=tuned_parts,
         tune_pitch=tune_pitch,
@@ -649,6 +646,7 @@ if uploaded_file is not None:
         margin=margin,
         carrier_width=carrier_width,
         pilot_dia=pilot_dia,
+        x_shift=x_shift, # ⭐ 수정됨: DXF 내보내기에도 x_shift 적용
         y_shift=y_shift
     )
     
