@@ -233,10 +233,10 @@ def plot_polygon(ax, poly, color, lw=1.5, alpha=0.5):
 
 
 # ============================================================
-# [3] 배열 각도 스캔 공통 로직
+# [3] 배열 각도 스캔 공통 로직 (⭐ 벤딩 각도 다중 입력 대응)
 # ============================================================
 def analyze_case(base_parts, origin, area_for_util, cost_divisor, bridge, margin, carrier_width,
-                  material_thickness, material_density, material_price, check_rolling, bend_line_angle, min_angle_from_rolling):
+                  material_thickness, material_density, material_price, check_rolling, bend_line_angles, min_angle_from_rolling):
     results, best, fallback_best = [], None, None
 
     for angle in range(0, 180, 10):
@@ -251,9 +251,13 @@ def analyze_case(base_parts, origin, area_for_util, cost_divisor, bridge, margin
 
         valid = True
         if check_rolling:
-            eff_angle = (bend_line_angle + angle) % 180
-            dist_from_parallel = min(eff_angle, 180 - eff_angle)
-            valid = dist_from_parallel >= min_angle_from_rolling
+            # ⭐ 수정됨: 입력된 '모든' 벤딩 각도에 대해 조건을 검사합니다.
+            for b_angle in bend_line_angles:
+                eff_angle = (b_angle + angle) % 180
+                dist_from_parallel = min(eff_angle, 180 - eff_angle)
+                if dist_from_parallel < min_angle_from_rolling:
+                    valid = False
+                    break # 하나라도 조건을 위반하면 이 배열 각도는 불합격(X)
 
         results.append({
             '각도': f"{angle}°", '피치(mm)': round(p_val, 2), '소재폭(mm)': round(w_val, 2),
@@ -293,18 +297,13 @@ def render_case_column(col, label, results, best, used_fallback, colors, margin,
         st.pyplot(fig)
 
         df = pd.DataFrame(results)  
-        
-        # ⭐ 버그 수정 1: 최적안(best)이 항상 맨 위에 오도록 정렬 순서 강제
         df['is_chosen'] = df['각도'] == f"{best['angle']}°"
-        # 선택된 최적안을 무조건 1순위로 올리고, 그 다음은 이용율 내림차순으로 정렬
         df = df.sort_values(by=['is_chosen', '소재이용율(%)'], ascending=[False, False]).reset_index(drop=True)
         df = df.drop(columns=['is_chosen'])
         
-        # ⭐ 버그 수정 2: 하이라이트 조건을 '단순히 높은 이용율'이 아니라 '선택된 최적안'으로 명확히 변경
         def highlight(row):
             is_chosen = (row['각도'] == f"{best['angle']}°")
             if is_chosen: 
-                # 프로그램이 뽑아낸 최종 최적안은 압연제약 무시(Fallback) 상태라도 파란색 볼드로 표시
                 return ['color: blue; font-weight: bold; background-color: #e6f2ff;'] * len(row)
             if row['압연방향 적합'] == 'X': 
                 return ['background-color: #ffe6e6;'] * len(row)
@@ -452,10 +451,22 @@ st_simul = st.sidebar.number_input("➖ 동시 성형 (중복 차감)", value=0,
 total_stations = max(1, int((st_notch + st_pierce + st_bend + st_form + st_final_notch + st_idle) - st_simul))
 st.sidebar.info(f"**총 예상 스테이션: {total_stations} 피치**")
 
+# ⭐ 수정됨: 벤딩 각도 다중 입력 대응 UI
 st.sidebar.header("🧭 5. 압연방향(그레인) 제약")
 apply_rolling_constraint = st.sidebar.checkbox("벤딩 라인 - 압연방향 최소 이격각 적용", value=(st_bend > 0), help="프레스 피드 방향(=압연방향, 도면 X축과 평행)과 벤딩 라인이 너무 나란하면 성형 시 크랙 위험이 커집니다.")
-bend_line_angle = st.sidebar.number_input("부품 좌표계 기준 벤딩 라인 각도 (°, 0=부품 X축과 평행)", value=0.0, step=5.0, disabled=not apply_rolling_constraint)
+
+# 텍스트 입력을 받아 여러 각도를 처리 (예: "0, 90")
+bend_angles_input = st.sidebar.text_input("벤딩 라인 각도 (°, 쉼표로 다중 입력)", value="0", disabled=not apply_rolling_constraint, help="예시: 단일 벤딩은 '0', 4면 직교 벤딩은 '0, 90'과 같이 쉼표로 구분하여 입력하세요.")
 min_angle_from_rolling = st.sidebar.number_input("최소 이격각 (°, 통상 30~45° 권장)", value=30.0, step=5.0, disabled=not apply_rolling_constraint)
+
+# 문자열 파싱 (예외 처리 포함)
+bend_line_angles = []
+if apply_rolling_constraint:
+    try:
+        bend_line_angles = [float(x.strip()) for x in bend_angles_input.split(',')]
+    except ValueError:
+        st.sidebar.error("❌ 벤딩 라인 각도는 숫자와 쉼표(,)로만 입력해주세요. (예: 0, 90)")
+        st.stop()
 
 
 # ============================================================
@@ -467,10 +478,11 @@ uploaded_file = st.file_uploader("DXF 전개도면을 업로드하세요.", type
 
 file_hash = hashlib.md5(uploaded_file.getvalue()).hexdigest() if uploaded_file else None
 
+# 캐시 키에 다중 벤딩 각도(Tuple 형태) 반영
 current_params = (
     file_hash, bridge, margin, carrier_width,
     material_thickness, material_density, material_price, 
-    apply_rolling_constraint, bend_line_angle, min_angle_from_rolling
+    apply_rolling_constraint, tuple(bend_line_angles), min_angle_from_rolling
 )
 
 if 'last_params' not in st.session_state:
@@ -503,7 +515,7 @@ if uploaded_file is not None:
                 bridge=bridge, margin=margin, carrier_width=carrier_width,
                 material_thickness=material_thickness, material_density=material_density,
                 material_price=material_price, check_rolling=apply_rolling_constraint,
-                bend_line_angle=bend_line_angle, min_angle_from_rolling=min_angle_from_rolling,
+                bend_line_angles=bend_line_angles, min_angle_from_rolling=min_angle_from_rolling,
             )
 
             single_results, best_s, s_fallback = analyze_case([part], 'center', part_area, 1, **common_kwargs)
