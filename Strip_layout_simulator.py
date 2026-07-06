@@ -109,7 +109,7 @@ def find_best_interlock(part, bridge):
     best_pair_geom, best_part_a, best_part_b = None, part, None
     min_box_area = float('inf')
 
-    for dy in np.linspace(-h * 0.8, h * 0.8, 20):
+    for dy in np.linspace(-h * 0.8, h * 0.8, 40):
         dx = w + bridge
         step = w / 30
         while dx > -w:
@@ -140,18 +140,23 @@ def find_best_interlock(part, bridge):
 def find_best_zigzag(part, bridge):
     part_b_same = part
     p_base = calculate_1d_pitch(part, bridge)
-    buffered_a1 = part.buffer(bridge, resolution=4)
-    buffered_a2 = translate(buffered_a1, xoff=p_base, yoff=0)
+    buffered_a = part.buffer(bridge, resolution=4)
     minx, miny, maxx, maxy = part.bounds
-    h = maxy - miny
+    w, h = maxx - minx, maxy - miny
+    
+    reps = int(np.ceil(w / p_base)) + 2
+    base_geoms = [translate(buffered_a, xoff=i*p_base, yoff=0) for i in range(-2, reps+1)]
+    base_row = unary_union(base_geoms)
+
     best_pair_geom, best_part_a, best_part_b = None, part, None
     best_dy = float('inf')
 
-    for dx in np.linspace(0, p_base, 20):
+    for dx in np.linspace(0, p_base, 60):
         dy = h
         step = h / 20
         test_b = translate(part_b_same, xoff=dx, yoff=dy)
-        while not (buffered_a1.intersects(test_b) or buffered_a2.intersects(test_b)):
+        
+        while not base_row.intersects(test_b):
             dy -= step
             if dy < -h * 1.5: break
             test_b = translate(part_b_same, xoff=dx, yoff=dy)
@@ -159,7 +164,8 @@ def find_best_zigzag(part, bridge):
         dy += step
         fine_step = step / 10
         test_b = translate(part_b_same, xoff=dx, yoff=dy)
-        while not (buffered_a1.intersects(test_b) or buffered_a2.intersects(test_b)):
+        
+        while not base_row.intersects(test_b):
             dy -= fine_step
             if dy < -h * 1.5: break
             test_b = translate(part_b_same, xoff=dx, yoff=dy)
@@ -233,13 +239,14 @@ def plot_polygon(ax, poly, color, lw=1.5, alpha=0.5):
 
 
 # ============================================================
-# [3] 배열 각도 스캔 공통 로직 (⭐ 벤딩 각도 다중 입력 대응)
+# [3] 배열 각도 스캔 공통 로직 (⭐ angle_step 반영)
 # ============================================================
 def analyze_case(base_parts, origin, area_for_util, cost_divisor, bridge, margin, carrier_width,
-                  material_thickness, material_density, material_price, check_rolling, bend_line_angles, min_angle_from_rolling):
+                  material_thickness, material_density, material_price, check_rolling, bend_line_angles, min_angle_from_rolling, angle_step):
     results, best, fallback_best = [], None, None
 
-    for angle in range(0, 180, 10):
+    # ⭐ 사용자가 선택한 각도 간격(5도 or 10도)으로 순회
+    for angle in range(0, 180, angle_step):
         rotated = [rotate(g, angle, origin=origin) for g in base_parts]
         unioned = rotated[0] if len(rotated) == 1 else unary_union(rotated)
 
@@ -251,13 +258,12 @@ def analyze_case(base_parts, origin, area_for_util, cost_divisor, bridge, margin
 
         valid = True
         if check_rolling:
-            # ⭐ 수정됨: 입력된 '모든' 벤딩 각도에 대해 조건을 검사합니다.
             for b_angle in bend_line_angles:
                 eff_angle = (b_angle + angle) % 180
                 dist_from_parallel = min(eff_angle, 180 - eff_angle)
                 if dist_from_parallel < min_angle_from_rolling:
                     valid = False
-                    break # 하나라도 조건을 위반하면 이 배열 각도는 불합격(X)
+                    break 
 
         results.append({
             '각도': f"{angle}°", '피치(mm)': round(p_val, 2), '소재폭(mm)': round(w_val, 2),
@@ -451,15 +457,12 @@ st_simul = st.sidebar.number_input("➖ 동시 성형 (중복 차감)", value=0,
 total_stations = max(1, int((st_notch + st_pierce + st_bend + st_form + st_final_notch + st_idle) - st_simul))
 st.sidebar.info(f"**총 예상 스테이션: {total_stations} 피치**")
 
-# ⭐ 수정됨: 벤딩 각도 다중 입력 대응 UI
 st.sidebar.header("🧭 5. 압연방향(그레인) 제약")
 apply_rolling_constraint = st.sidebar.checkbox("벤딩 라인 - 압연방향 최소 이격각 적용", value=(st_bend > 0), help="프레스 피드 방향(=압연방향, 도면 X축과 평행)과 벤딩 라인이 너무 나란하면 성형 시 크랙 위험이 커집니다.")
 
-# 텍스트 입력을 받아 여러 각도를 처리 (예: "0, 90")
 bend_angles_input = st.sidebar.text_input("벤딩 라인 각도 (°, 쉼표로 다중 입력)", value="0", disabled=not apply_rolling_constraint, help="예시: 단일 벤딩은 '0', 4면 직교 벤딩은 '0, 90'과 같이 쉼표로 구분하여 입력하세요.")
 min_angle_from_rolling = st.sidebar.number_input("최소 이격각 (°, 통상 30~45° 권장)", value=30.0, step=5.0, disabled=not apply_rolling_constraint)
 
-# 문자열 파싱 (예외 처리 포함)
 bend_line_angles = []
 if apply_rolling_constraint:
     try:
@@ -472,17 +475,24 @@ if apply_rolling_constraint:
 # ============================================================
 # [6] 메인 화면 동작 및 결과 캐싱 로직
 # ============================================================
-st.markdown("#### 📂 도면 업로드")
+# ⭐ UI 업데이트: 작업 순서에 맞춘 업로드 및 옵션 선택부
+st.markdown("#### 📂 1. 도면 업로드")
 st.info("💡 **DXF 업로드 시 주의사항:** 정확한 계산을 위해 제품의 외곽선과 내부 피어싱 홀들은 반드시 각각 하나의 **'닫힌 폴리라인(Closed Polyline)'**으로 연결되어 있어야 합니다. (CAD에서 `JOIN` 또는 `REGION` 명령어로 결합 후 저장)")
 uploaded_file = st.file_uploader("DXF 전개도면을 업로드하세요.", type=['dxf'])
 
+st.markdown("#### 📐 2. 계산 각도 옵션 선택")
+angle_step_option = st.radio("배열 회전 탐색 각도 간격을 선택하세요:", ["10도씩 (기본, 빠른 계산)", "5도씩 (정밀 계산)"], horizontal=True)
+angle_step = 5 if "5도" in angle_step_option else 10
+
+
 file_hash = hashlib.md5(uploaded_file.getvalue()).hexdigest() if uploaded_file else None
 
-# 캐시 키에 다중 벤딩 각도(Tuple 형태) 반영
+# 캐시 키에 angle_step 추가
 current_params = (
     file_hash, bridge, margin, carrier_width,
     material_thickness, material_density, material_price, 
-    apply_rolling_constraint, tuple(bend_line_angles), min_angle_from_rolling
+    apply_rolling_constraint, tuple(bend_line_angles), min_angle_from_rolling,
+    angle_step
 )
 
 if 'last_params' not in st.session_state:
@@ -490,7 +500,7 @@ if 'last_params' not in st.session_state:
 
 if uploaded_file is not None:
     if st.session_state.last_params != current_params:
-        with st.spinner('단위 변환, 내측 홀 인식, 안전 간격 적용 및 정밀 형상 맞춤(Nesting)을 분석 중입니다... (약 15초 소요)'):
+        with st.spinner('단위 변환, 내측 홀 인식, 안전 간격 적용 및 정밀 형상 맞춤(Nesting)을 분석 중입니다...'):
             with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp:
                 tmp.write(uploaded_file.getvalue())
                 tmp_path = tmp.name
@@ -516,6 +526,7 @@ if uploaded_file is not None:
                 material_thickness=material_thickness, material_density=material_density,
                 material_price=material_price, check_rolling=apply_rolling_constraint,
                 bend_line_angles=bend_line_angles, min_angle_from_rolling=min_angle_from_rolling,
+                angle_step=angle_step # ⭐ 새로 추가된 angle_step 파라미터 전달
             )
 
             single_results, best_s, s_fallback = analyze_case([part], 'center', part_area, 1, **common_kwargs)
@@ -557,6 +568,9 @@ if uploaded_file is not None:
     st.success(f"🏆 분석 완료! 가장 훌륭한 배열은 **[{best_method_name}]**이며, 단일 배열 대비 1개당 :blue[**{saving_cost:,}원**]을 절감합니다. (캐리어 폭 {carrier_width}mm 포함 기준)")
 
     st.header("📊 [1단계] 단위 배열 최적화 결과")
+    if apply_rolling_constraint:
+        st.markdown("💡 **안내:** 표 내부의 <span style='background-color:#ffe6e6; padding:2px 6px; border-radius:4px;'>붉은색 행</span>은 압연방향(그레인) 이격각 조건을 불만족하여 **크랙(터짐) 불량 위험이 높은 기각(사용 불가) 배열**을 의미합니다.", unsafe_allow_html=True)
+
     col1, col2, col3 = st.columns(3)
     render_case_column(col1, "[1] 단일 배열", s_res, best_s, s_fall, ['#004b87'], margin, carrier_width)
     
@@ -710,7 +724,7 @@ if uploaded_file is not None:
     # ============================================================
     st.divider()
     st.subheader("💾 [4단계] CAD 도면(DXF) 내보내기")
-    st.markdown("위에서 미세조정을 마친 최종 배열을 CAD(AutoCAD 등)에서 바로 작업할 수 있도록 **DXF 파일로 다운로드**합니다. 레이어 분리(외곽선/제품/파일럿홀)가 적용되어 있어 실무 설계에 즉시 활용 가능합니다.")
+    st.markdown("위에서 미세조정을 마친 최종 배열을 CAD(AutoCAD 등)에서 바로 작업할 수 있도록 **DXF 파일로 다운로드**합니다. 레이어 분리(외곽선/제품/파일럿홀)가 적용되어 실무 설계에 즉시 활용 가능합니다.")
     
     dxf_bytes = generate_dxf_bytes(
         tuned_parts=tuned_parts,
