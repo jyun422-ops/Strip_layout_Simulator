@@ -176,7 +176,7 @@ def find_best_zigzag(part, bridge):
 
 
 # ============================================================
-# [2] DXF 읽기
+# [2] DXF 읽기 및 시각화(Rendering)
 # ============================================================
 def read_part_with_holes(msp, unit_factor):
     candidates = []
@@ -202,20 +202,42 @@ def read_part_with_holes(msp, unit_factor):
     net_part = Polygon(outer.exterior.coords, [h.exterior.coords for h in holes]) if holes else outer
     return net_part, holes
 
+
 def plot_polygon(ax, poly, color, lw=1.5, alpha=0.5):
-    ext = np.array(poly.exterior.coords)
-    verts = ext.tolist()
-    codes = [MplPath.MOVETO] + [MplPath.LINETO] * (len(ext) - 2) + [MplPath.CLOSEPOLY]
+    """
+    ⭐ 개선: 내측 홀(Piercing Hole)을 완벽한 '색없음(빈 공간)'으로 시각화합니다.
+    """
+    verts = []
+    codes = []
+    
+    # 1. 외곽선(Exterior) 처리 - 반시계 방향(CCW) 유지
+    ext_coords = list(poly.exterior.coords)
+    if not poly.exterior.is_ccw:
+        ext_coords = ext_coords[::-1]
+        
+    verts.extend(ext_coords)
+    codes += [MplPath.MOVETO] + [MplPath.LINETO] * (len(ext_coords) - 2) + [MplPath.CLOSEPOLY]
+    
+    # 2. 내측 홀(Interiors) 처리 - 시계 방향(CW) 유지 (올바른 구멍 인식을 위함)
     for interior in poly.interiors:
-        intc = np.array(interior.coords)
-        verts += intc.tolist()
-        codes += [MplPath.MOVETO] + [MplPath.LINETO] * (len(intc) - 2) + [MplPath.CLOSEPOLY]
-    patch = PathPatch(MplPath(verts, codes), facecolor=color, edgecolor=color, linewidth=lw, alpha=alpha)
+        int_coords = list(interior.coords)
+        if interior.is_ccw:
+            int_coords = int_coords[::-1]
+        verts.extend(int_coords)
+        codes += [MplPath.MOVETO] + [MplPath.LINETO] * (len(int_coords) - 2) + [MplPath.CLOSEPOLY]
+        
+    # 3. PathPatch 적용 (구멍 뚫린 폴리곤 렌더링)
+    patch = PathPatch(MplPath(verts, codes), facecolor=color, edgecolor=color, linewidth=lw, alpha=alpha, zorder=2)
     ax.add_patch(patch)
-    ax.plot(*poly.exterior.xy, color=color, linewidth=lw)
+    
+    # 4. 내측 홀 "색없음" 강조를 위해 내부를 완전히 하얀색으로 덧칠 (완벽한 투명화 효과)
     for interior in poly.interiors:
         xs, ys = interior.xy
-        ax.plot(xs, ys, color=color, linewidth=lw * 0.8)
+        ax.fill(xs, ys, color='white', alpha=1.0, zorder=3) # 홀 내부를 완전히 비워버림 (배경색과 동일화)
+        ax.plot(xs, ys, color=color, linewidth=lw * 0.8, zorder=4) # 홀 테두리는 제품색으로 유지
+        
+    # 5. 제품 외곽선 테두리 그리기
+    ax.plot(*poly.exterior.xy, color=color, linewidth=lw, zorder=4)
 
 
 # ============================================================
@@ -254,6 +276,7 @@ def analyze_case(base_parts, origin, area_for_util, cost_divisor, bridge, margin
     if best is None: best = fallback_best
     return results, best, used_fallback
 
+
 def render_case_column(col, label, results, best, used_fallback, colors, margin, carrier_width):
     with col:
         st.subheader(f"{label} ({best['angle']}°)")
@@ -274,10 +297,10 @@ def render_case_column(col, label, results, best, used_fallback, colors, margin,
         
         ax.axis('equal'); ax.set_xticks([]); ax.set_yticks([])
         ax.legend(loc='lower center', bbox_to_anchor=(0.5, -0.15), fontsize=9, framealpha=1.0)
-        fig.subplots_adjust(bottom=0.28)  # ⭐ 버그수정⑦: 축 바깥 범례가 캔버스 밖으로 잘리지 않도록 여백 확보
+        fig.subplots_adjust(bottom=0.28)  
         st.pyplot(fig)
 
-        df = pd.DataFrame(results)  # ⭐ 버그수정⑥: 이용율 내림차순 재정렬을 제거해 각도 순서(추세)를 그대로 유지
+        df = pd.DataFrame(results)  
         max_util = df['소재이용율(%)'].max()
         
         def highlight(row):
@@ -307,8 +330,8 @@ def plot_strip_layout(parts_and_colors, pitch, part_zone_width, margin, carrier_
             label=f'금형 코어 최소 사이즈\n(가로: {total_length:.1f} x 세로: {strip_width:.1f})')
 
     if carrier_width > 0:
-        ax.add_patch(Rectangle((0, 0), total_length, carrier_width, facecolor='#999999', alpha=0.25, edgecolor='none'))
-        ax.add_patch(Rectangle((0, strip_width - carrier_width), total_length, carrier_width, facecolor='#999999', alpha=0.25, edgecolor='none', label='캐리어(스켈레톤) 영역'))
+        ax.add_patch(Rectangle((0, 0), total_length, carrier_width, facecolor='#999999', alpha=0.25, edgecolor='none', zorder=1))
+        ax.add_patch(Rectangle((0, strip_width - carrier_width), total_length, carrier_width, facecolor='#999999', alpha=0.25, edgecolor='none', label='캐리어(스켈레톤) 영역', zorder=1))
 
     y_offset, x_offset = -miny + margin + carrier_width, -minx + (pitch * 0.2)
 
@@ -320,7 +343,7 @@ def plot_strip_layout(parts_and_colors, pitch, part_zone_width, margin, carrier_
         if carrier_width > 0 and 0 < pilot_dia < carrier_width:
             ax.add_patch(Circle((pitch * (i + 0.5), carrier_width / 2), pilot_dia / 2, facecolor='white', edgecolor='black', linewidth=1.2, zorder=5))
         if i < total_stations - 1:
-            ax.plot([pitch * (i + 1), pitch * (i + 1)], [0, strip_width], color='black', linestyle=':', alpha=0.4)
+            ax.plot([pitch * (i + 1), pitch * (i + 1)], [0, strip_width], color='black', linestyle=':', alpha=0.4, zorder=1)
 
     ax.axis('equal')
     ax.set_xticks([]); ax.set_yticks([])
@@ -436,8 +459,6 @@ min_angle_from_rolling = st.sidebar.number_input("최소 이격각 (°, 통상 3
 # ============================================================
 uploaded_file = st.file_uploader("DXF 전개도면을 업로드하세요.", type=['dxf'])
 
-# ⭐ 버그수정④: 파일명이 아니라 '파일 내용'으로 캐시 키를 만든다.
-#    같은 파일명으로 다른 도면을 재업로드해도 예전 결과가 남아있지 않도록 함.
 file_hash = hashlib.md5(uploaded_file.getvalue()).hexdigest() if uploaded_file else None
 
 current_params = (
@@ -566,8 +587,6 @@ if uploaded_file is not None:
     target_best = next(v for k, v in candidates if k == tune_target_name)
     is_pair = tune_target_name != '단일 배열'
 
-    # ⭐ 버그수정②: 위젯 key에 tune_target_name을 포함시켜, 배열 방식을 바꾸면
-    #    이전에 입력했던 값이 아니라 새 방식의 기본값(자동 최적값)으로 초기화되도록 함.
     tkey = tune_target_name
 
     fc1, fc2 = st.columns(2)
@@ -575,7 +594,6 @@ if uploaded_file is not None:
         st.subheader("⚙️ 파라미터 미세조정")
         tune_angle = st.number_input("전체 회전 각도 (°, 원본 기준)", value=float(target_best['angle']),
                                       step=1.0, key=f"tune_angle_{tkey}")
-        # ⭐ 버그수정⑤: 0 이하 입력 시 ZeroDivisionError로 앱이 죽는 것을 방지
         tune_pitch = st.number_input("피치 (Pitch, mm)", value=float(target_best['p']), step=0.1,
                                       min_value=0.1, key=f"tune_pitch_{tkey}")
         tune_width = st.number_input("소재 폭 (Width, mm)", value=float(target_best['w']), step=0.5,
@@ -609,15 +627,14 @@ if uploaded_file is not None:
     all_geom_tuned = tuned_parts[0] if len(tuned_parts) == 1 else unary_union(tuned_parts)
     minx, miny, maxx, maxy = all_geom_tuned.bounds
 
-    # ⭐ 버그수정③: 간섭(브릿지 침범) 및 최소 폭 검증 — 조용히 잘못된 결과를 내보내지 않도록 경고
     min_required_pitch = calculate_1d_pitch(all_geom_tuned, bridge)
     min_required_width = (maxy - miny) + margin * 2 + carrier_width * 2
-    interference_tol = 0.01  # mm, 부동소수 오차 허용
+    interference_tol = 0.01  
 
     if tune_pitch < min_required_pitch - interference_tol:
         st.error(f"🚫 **간섭 경고:** 현재 피치({tune_pitch:.2f}mm)가 이 각도/오프셋에서 필요한 "
                  f"최소 피치({min_required_pitch:.2f}mm)보다 작습니다. 인접 스테이션과 부품이 겹치거나 "
-                 f"최소 브릿지 간격을 침범할 수 있습니다. 피치를 늘리거나 각도/오프셋을 조정하세요.")
+                 f"최소 간격을 침범할 수 있습니다. 피치를 늘리거나 각도/오프셋을 조정하세요.")
     if tune_width < min_required_width - interference_tol:
         st.error(f"🚫 **폭 부족 경고:** 현재 소재 폭({tune_width:.2f}mm)이 이 형상을 담기 위한 "
                  f"최소 폭({min_required_width:.2f}mm)보다 작습니다. 부품이 마진/캐리어 영역을 벗어날 수 있습니다.")
@@ -634,10 +651,6 @@ if uploaded_file is not None:
     total_length_tuned = (tune_pitch * (total_stations - 1)) + part_length_tuned + (tune_pitch * 0.4)
     x_shift = -minx + (tune_pitch * 0.2)
 
-    # ⭐ 버그수정①: y_shift는 반드시 '현재(튜닝된) 형상'의 miny를 기준으로 계산해야 한다.
-    #    이전 코드는 튜닝 전(원본) 형상의 miny를 그대로 썼기 때문에, 각도를 조정하거나
-    #    파트1 Y오프셋을 주면 그림/DXF에서 부품 위치가 마진·캐리어 기준과 어긋났다.
-    #    (소재 폭을 최소치보다 늘렸을 때는 남는 여유를 상하 대칭으로 분배)
     extra_width = max(0.0, tune_width - min_required_width)
     y_shift = -miny + margin + carrier_width + extra_width / 2
 
@@ -648,8 +661,8 @@ if uploaded_file is not None:
                  label=f'조정 후 코어 사이즈\n(가로: {total_length_tuned:.1f} x 세로: {tune_width:.1f} | 피치: {tune_pitch:.2f})')
     
     if carrier_width > 0:
-        ax_tune.add_patch(Rectangle((0, 0), total_length_tuned, carrier_width, facecolor='#999999', alpha=0.25, edgecolor='none'))
-        ax_tune.add_patch(Rectangle((0, tune_width - carrier_width), total_length_tuned, carrier_width, facecolor='#999999', alpha=0.25, edgecolor='none'))
+        ax_tune.add_patch(Rectangle((0, 0), total_length_tuned, carrier_width, facecolor='#999999', alpha=0.25, edgecolor='none', zorder=1))
+        ax_tune.add_patch(Rectangle((0, tune_width - carrier_width), total_length_tuned, carrier_width, facecolor='#999999', alpha=0.25, edgecolor='none', zorder=1))
 
     for i in range(total_stations):
         for idx, geom in enumerate(tuned_parts):
@@ -661,14 +674,14 @@ if uploaded_file is not None:
         if carrier_width > 0 and 0 < pilot_dia < carrier_width:
             ax_tune.add_patch(Circle((tune_pitch * (i + 0.5), carrier_width / 2), pilot_dia / 2, facecolor='white', edgecolor='black', linewidth=1.2, zorder=5))
         if i < total_stations - 1:
-            ax_tune.plot([tune_pitch * (i + 1), tune_pitch * (i + 1)], [0, tune_width], color='black', linestyle=':', alpha=0.4)
+            ax_tune.plot([tune_pitch * (i + 1), tune_pitch * (i + 1)], [0, tune_width], color='black', linestyle=':', alpha=0.4, zorder=1)
 
     ax_tune.axis('equal'); ax_tune.set_xticks([]); ax_tune.set_yticks([])
     ax_tune.legend(loc='center left', bbox_to_anchor=(1.02, 0.5))
     st.pyplot(fig_tune)
 
     # ============================================================
-    # [8] CAD 작업용 DXF Export (우선순위 2 반영)
+    # [8] CAD 작업용 DXF Export 
     # ============================================================
     st.divider()
     st.subheader("💾 [4단계] CAD 도면(DXF) 내보내기")
