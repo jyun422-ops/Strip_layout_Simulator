@@ -204,13 +204,9 @@ def read_part_with_holes(msp, unit_factor):
 
 
 def plot_polygon(ax, poly, color, lw=1.5, alpha=0.5):
-    """
-    ⭐ 개선: 내측 홀(Piercing Hole)을 완벽한 '색없음(빈 공간)'으로 시각화합니다.
-    """
     verts = []
     codes = []
     
-    # 1. 외곽선(Exterior) 처리 - 반시계 방향(CCW) 유지
     ext_coords = list(poly.exterior.coords)
     if not poly.exterior.is_ccw:
         ext_coords = ext_coords[::-1]
@@ -218,7 +214,6 @@ def plot_polygon(ax, poly, color, lw=1.5, alpha=0.5):
     verts.extend(ext_coords)
     codes += [MplPath.MOVETO] + [MplPath.LINETO] * (len(ext_coords) - 2) + [MplPath.CLOSEPOLY]
     
-    # 2. 내측 홀(Interiors) 처리 - 시계 방향(CW) 유지 (올바른 구멍 인식을 위함)
     for interior in poly.interiors:
         int_coords = list(interior.coords)
         if interior.is_ccw:
@@ -226,17 +221,14 @@ def plot_polygon(ax, poly, color, lw=1.5, alpha=0.5):
         verts.extend(int_coords)
         codes += [MplPath.MOVETO] + [MplPath.LINETO] * (len(int_coords) - 2) + [MplPath.CLOSEPOLY]
         
-    # 3. PathPatch 적용 (구멍 뚫린 폴리곤 렌더링)
     patch = PathPatch(MplPath(verts, codes), facecolor=color, edgecolor=color, linewidth=lw, alpha=alpha, zorder=2)
     ax.add_patch(patch)
     
-    # 4. 내측 홀 "색없음" 강조를 위해 내부를 완전히 하얀색으로 덧칠 (완벽한 투명화 효과)
     for interior in poly.interiors:
         xs, ys = interior.xy
-        ax.fill(xs, ys, color='white', alpha=1.0, zorder=3) # 홀 내부를 완전히 비워버림 (배경색과 동일화)
-        ax.plot(xs, ys, color=color, linewidth=lw * 0.8, zorder=4) # 홀 테두리는 제품색으로 유지
+        ax.fill(xs, ys, color='white', alpha=1.0, zorder=3) 
+        ax.plot(xs, ys, color=color, linewidth=lw * 0.8, zorder=4) 
         
-    # 5. 제품 외곽선 테두리 그리기
     ax.plot(*poly.exterior.xy, color=color, linewidth=lw, zorder=4)
 
 
@@ -441,15 +433,19 @@ pilot_dia = st.sidebar.number_input("파일럿 홀 지름 (mm)", value=4.0, step
 st.sidebar.header("🛠️ 4. Layout도 설계")
 st_notch = st.sidebar.number_input("노칭 / 파이롯트 홀", value=1, step=1)
 st_pierce = st.sidebar.number_input("피어싱 (내측 홀 타발)", value=1, step=1)
-st_form = st.sidebar.number_input("벤딩 / 포밍", value=0, step=1)
-st_blank = st.sidebar.number_input("블랭킹 (최종 낙하)", value=1, step=1)
+st_bend = st.sidebar.number_input("벤딩", value=0, step=1)
+st_form = st.sidebar.number_input("포밍", value=0, step=1)
+st_final_notch = st.sidebar.number_input("노칭 (최종 낙하)", value=1, step=1)
 st_idle = st.sidebar.number_input("아이들 피치 (빈 구간)", value=1, step=1)
 st_simul = st.sidebar.number_input("➖ 동시 성형 (중복 차감)", value=0, step=1)
-total_stations = max(1, int((st_notch + st_pierce + st_form + st_blank + st_idle) - st_simul))
+
+# 총 스테이션 계산식에 벤딩, 포밍, 노칭 항목 분리 적용
+total_stations = max(1, int((st_notch + st_pierce + st_bend + st_form + st_final_notch + st_idle) - st_simul))
 st.sidebar.info(f"**총 예상 스테이션: {total_stations} 피치**")
 
 st.sidebar.header("🧭 5. 압연방향(그레인) 제약")
-apply_rolling_constraint = st.sidebar.checkbox("벤딩 라인 - 압연방향 최소 이격각 적용", value=(st_form > 0), help="프레스 피드 방향(=압연방향, 도면 X축과 평행)과 벤딩 라인이 너무 나란하면 성형 시 크랙 위험이 커집니다.")
+# 벤딩 값이 0 이상일 때만 자동 체크되도록 수정
+apply_rolling_constraint = st.sidebar.checkbox("벤딩 라인 - 압연방향 최소 이격각 적용", value=(st_bend > 0), help="프레스 피드 방향(=압연방향, 도면 X축과 평행)과 벤딩 라인이 너무 나란하면 성형 시 크랙 위험이 커집니다.")
 bend_line_angle = st.sidebar.number_input("부품 좌표계 기준 벤딩 라인 각도 (°, 0=부품 X축과 평행)", value=0.0, step=5.0, disabled=not apply_rolling_constraint)
 min_angle_from_rolling = st.sidebar.number_input("최소 이격각 (°, 통상 30~45° 권장)", value=30.0, step=5.0, disabled=not apply_rolling_constraint)
 
@@ -583,29 +579,36 @@ if uploaded_file is not None:
     st.header("🛠️ [3단계] 수동 미세 조정 (Fine-Tuning)")
     st.markdown("자동으로 계산된 최적 배열을 바탕으로 실무 설계자의 감각에 맞춰 **숫자를 증감(+, -) 시키면 즉시 도면과 원가에 반영**됩니다.")
 
+    if 'last_tune_target' not in st.session_state:
+        st.session_state.last_tune_target = None
+        
     tune_target_name = st.selectbox("조정할 배열 방식 선택", options=[k for k, v in candidates], index=[k for k, v in candidates].index(best_method_name))
     target_best = next(v for k, v in candidates if k == tune_target_name)
     is_pair = tune_target_name != '단일 배열'
 
     tkey = tune_target_name
 
+    if st.session_state.last_tune_target != tune_target_name:
+        st.session_state[f"tune_angle_{tkey}"] = float(target_best['angle'])
+        st.session_state[f"tune_pitch_{tkey}"] = float(target_best['p'])
+        st.session_state[f"tune_width_{tkey}"] = float(target_best['w'])
+        st.session_state[f"tune_y1_{tkey}"] = 0.0
+        st.session_state[f"tune_y2_{tkey}"] = 0.0
+        st.session_state[f"tune_x2_{tkey}"] = 0.0
+        st.session_state.last_tune_target = tune_target_name
+
     fc1, fc2 = st.columns(2)
     with fc1:
         st.subheader("⚙️ 파라미터 미세조정")
-        tune_angle = st.number_input("전체 회전 각도 (°, 원본 기준)", value=float(target_best['angle']),
-                                      step=1.0, key=f"tune_angle_{tkey}")
-        tune_pitch = st.number_input("피치 (Pitch, mm)", value=float(target_best['p']), step=0.1,
-                                      min_value=0.1, key=f"tune_pitch_{tkey}")
-        tune_width = st.number_input("소재 폭 (Width, mm)", value=float(target_best['w']), step=0.5,
-                                      min_value=0.1, key=f"tune_width_{tkey}")
+        tune_angle = st.number_input("전체 회전 각도 (°, 원본 기준)", step=1.0, key=f"tune_angle_{tkey}")
+        tune_pitch = st.number_input("피치 (Pitch, mm)", step=0.1, min_value=0.1, key=f"tune_pitch_{tkey}")
+        tune_width = st.number_input("소재 폭 (Width, mm)", step=0.5, min_value=0.1, key=f"tune_width_{tkey}")
 
     with fc2:
         st.subheader("↕️ 위치 오프셋 (Offset)")
-        tune_y1 = st.number_input("파트 1 Y축 위치 이동 (mm)", value=0.0, step=0.5, key=f"tune_y1_{tkey}")
-        tune_y2 = st.number_input("파트 2 Y축 위치 이동 (mm)", value=0.0, step=0.5,
-                                   disabled=not is_pair, key=f"tune_y2_{tkey}")
-        tune_x2 = st.number_input("파트 2 X축 위치 이동 (mm)", value=0.0, step=0.5,
-                                   disabled=not is_pair, key=f"tune_x2_{tkey}")
+        tune_y1 = st.number_input("파트 1 Y축 위치 이동 (mm)", step=0.5, key=f"tune_y1_{tkey}")
+        tune_y2 = st.number_input("파트 2 Y축 위치 이동 (mm)", step=0.5, disabled=not is_pair, key=f"tune_y2_{tkey}")
+        tune_x2 = st.number_input("파트 2 X축 위치 이동 (mm)", step=0.5, disabled=not is_pair, key=f"tune_x2_{tkey}")
 
     # 미세 조정된 형상 재계산
     if len(target_best['parts']) == 1:
