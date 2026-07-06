@@ -14,6 +14,7 @@ from shapely.ops import unary_union
 import tempfile
 import os
 import glob
+import hashlib
 
 
 # ============================================================
@@ -273,11 +274,10 @@ def render_case_column(col, label, results, best, used_fallback, colors, margin,
         
         ax.axis('equal'); ax.set_xticks([]); ax.set_yticks([])
         ax.legend(loc='lower center', bbox_to_anchor=(0.5, -0.15), fontsize=9, framealpha=1.0)
-        plt.tight_layout()
+        fig.subplots_adjust(bottom=0.28)  # ⭐ 버그수정⑦: 축 바깥 범례가 캔버스 밖으로 잘리지 않도록 여백 확보
         st.pyplot(fig)
 
-        df = pd.DataFrame(results)
-        df = df.sort_values(by='소재이용율(%)', ascending=False).reset_index(drop=True)
+        df = pd.DataFrame(results)  # ⭐ 버그수정⑥: 이용율 내림차순 재정렬을 제거해 각도 순서(추세)를 그대로 유지
         max_util = df['소재이용율(%)'].max()
         
         def highlight(row):
@@ -408,7 +408,6 @@ else:
     rec_bridge, rec_margin = max(1.5, 1.5 * material_thickness), max(2.0, 1.8 * material_thickness)
 
 st.sidebar.header("📏 2. 배열 간격 (다이 강도 고려)")
-# ⭐ 변경됨: "최소 브릿지" -> "부품간 최소 간격"
 bridge = st.sidebar.number_input("부품간 최소 간격 (mm)", value=float(round(rec_bridge, 1)), step=0.1)
 margin = st.sidebar.number_input("가장자리 마진 (mm)", value=float(round(rec_margin, 1)), step=0.1)
 
@@ -437,8 +436,12 @@ min_angle_from_rolling = st.sidebar.number_input("최소 이격각 (°, 통상 3
 # ============================================================
 uploaded_file = st.file_uploader("DXF 전개도면을 업로드하세요.", type=['dxf'])
 
+# ⭐ 버그수정④: 파일명이 아니라 '파일 내용'으로 캐시 키를 만든다.
+#    같은 파일명으로 다른 도면을 재업로드해도 예전 결과가 남아있지 않도록 함.
+file_hash = hashlib.md5(uploaded_file.getvalue()).hexdigest() if uploaded_file else None
+
 current_params = (
-    uploaded_file.name if uploaded_file else None, bridge, margin, carrier_width,
+    file_hash, bridge, margin, carrier_width,
     material_thickness, material_density, material_price, 
     apply_rolling_constraint, bend_line_angle, min_angle_from_rolling
 )
@@ -563,18 +566,28 @@ if uploaded_file is not None:
     target_best = next(v for k, v in candidates if k == tune_target_name)
     is_pair = tune_target_name != '단일 배열'
 
+    # ⭐ 버그수정②: 위젯 key에 tune_target_name을 포함시켜, 배열 방식을 바꾸면
+    #    이전에 입력했던 값이 아니라 새 방식의 기본값(자동 최적값)으로 초기화되도록 함.
+    tkey = tune_target_name
+
     fc1, fc2 = st.columns(2)
     with fc1:
         st.subheader("⚙️ 파라미터 미세조정")
-        tune_angle = st.number_input("전체 회전 각도 (°, 원본 기준)", value=float(target_best['angle']), step=1.0)
-        tune_pitch = st.number_input("피치 (Pitch, mm)", value=float(target_best['p']), step=0.1)
-        tune_width = st.number_input("소재 폭 (Width, mm)", value=float(target_best['w']), step=0.5)
+        tune_angle = st.number_input("전체 회전 각도 (°, 원본 기준)", value=float(target_best['angle']),
+                                      step=1.0, key=f"tune_angle_{tkey}")
+        # ⭐ 버그수정⑤: 0 이하 입력 시 ZeroDivisionError로 앱이 죽는 것을 방지
+        tune_pitch = st.number_input("피치 (Pitch, mm)", value=float(target_best['p']), step=0.1,
+                                      min_value=0.1, key=f"tune_pitch_{tkey}")
+        tune_width = st.number_input("소재 폭 (Width, mm)", value=float(target_best['w']), step=0.5,
+                                      min_value=0.1, key=f"tune_width_{tkey}")
 
     with fc2:
         st.subheader("↕️ 위치 오프셋 (Offset)")
-        tune_y1 = st.number_input("파트 1 Y축 위치 이동 (mm)", value=0.0, step=0.5)
-        tune_y2 = st.number_input("파트 2 Y축 위치 이동 (mm)", value=0.0, step=0.5, disabled=not is_pair)
-        tune_x2 = st.number_input("파트 2 X축 위치 이동 (mm)", value=0.0, step=0.5, disabled=not is_pair)
+        tune_y1 = st.number_input("파트 1 Y축 위치 이동 (mm)", value=0.0, step=0.5, key=f"tune_y1_{tkey}")
+        tune_y2 = st.number_input("파트 2 Y축 위치 이동 (mm)", value=0.0, step=0.5,
+                                   disabled=not is_pair, key=f"tune_y2_{tkey}")
+        tune_x2 = st.number_input("파트 2 X축 위치 이동 (mm)", value=0.0, step=0.5,
+                                   disabled=not is_pair, key=f"tune_x2_{tkey}")
 
     # 미세 조정된 형상 재계산
     if len(target_best['parts']) == 1:
@@ -593,6 +606,22 @@ if uploaded_file is not None:
             g = translate(g, tune_x2, tune_y2)
         tuned_parts.append(g)
 
+    all_geom_tuned = tuned_parts[0] if len(tuned_parts) == 1 else unary_union(tuned_parts)
+    minx, miny, maxx, maxy = all_geom_tuned.bounds
+
+    # ⭐ 버그수정③: 간섭(브릿지 침범) 및 최소 폭 검증 — 조용히 잘못된 결과를 내보내지 않도록 경고
+    min_required_pitch = calculate_1d_pitch(all_geom_tuned, bridge)
+    min_required_width = (maxy - miny) + margin * 2 + carrier_width * 2
+    interference_tol = 0.01  # mm, 부동소수 오차 허용
+
+    if tune_pitch < min_required_pitch - interference_tol:
+        st.error(f"🚫 **간섭 경고:** 현재 피치({tune_pitch:.2f}mm)가 이 각도/오프셋에서 필요한 "
+                 f"최소 피치({min_required_pitch:.2f}mm)보다 작습니다. 인접 스테이션과 부품이 겹치거나 "
+                 f"최소 브릿지 간격을 침범할 수 있습니다. 피치를 늘리거나 각도/오프셋을 조정하세요.")
+    if tune_width < min_required_width - interference_tol:
+        st.error(f"🚫 **폭 부족 경고:** 현재 소재 폭({tune_width:.2f}mm)이 이 형상을 담기 위한 "
+                 f"최소 폭({min_required_width:.2f}mm)보다 작습니다. 부품이 마진/캐리어 영역을 벗어날 수 있습니다.")
+
     # 원가 재계산
     tune_util = (st.session_state['pair_area'] if is_pair else st.session_state['part_area']) / (tune_pitch * tune_width) * 100
     cost_divisor = 2 if is_pair else 1
@@ -601,15 +630,16 @@ if uploaded_file is not None:
     st.success(f"**미세조정 결과** ➔ 변경된 소재이용율: :blue[**{tune_util:.2f}%**]  |  변경된 1개당 단가: :blue[**{int(tune_cost):,}원**]")
 
     # 화면 렌더링용 기하학 계산
-    all_geom_tuned = tuned_parts[0] if len(tuned_parts) == 1 else unary_union(tuned_parts)
-    minx, miny, maxx, maxy = all_geom_tuned.bounds
     part_length_tuned = maxx - minx
     total_length_tuned = (tune_pitch * (total_stations - 1)) + part_length_tuned + (tune_pitch * 0.4)
     x_shift = -minx + (tune_pitch * 0.2)
-    
-    orig_all_geom = target_best['parts'][0] if len(target_best['parts']) == 1 else unary_union(target_best['parts'])
-    orig_miny = orig_all_geom.bounds[1]
-    y_shift = -orig_miny + margin + carrier_width + ((tune_width - target_best['w']) / 2)
+
+    # ⭐ 버그수정①: y_shift는 반드시 '현재(튜닝된) 형상'의 miny를 기준으로 계산해야 한다.
+    #    이전 코드는 튜닝 전(원본) 형상의 miny를 그대로 썼기 때문에, 각도를 조정하거나
+    #    파트1 Y오프셋을 주면 그림/DXF에서 부품 위치가 마진·캐리어 기준과 어긋났다.
+    #    (소재 폭을 최소치보다 늘렸을 때는 남는 여유를 상하 대칭으로 분배)
+    extra_width = max(0.0, tune_width - min_required_width)
+    y_shift = -miny + margin + carrier_width + extra_width / 2
 
     fig_tune, ax_tune = plt.subplots(figsize=(max(8, total_stations * 2), 4))
     
