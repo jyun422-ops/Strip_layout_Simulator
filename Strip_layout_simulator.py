@@ -276,7 +276,6 @@ def render_case_column(col, label, results, best, used_fallback, colors, margin,
         plt.tight_layout()
         st.pyplot(fig)
 
-        # ⭐ 수정됨: 표의 결과(Dataframe)를 '소재이용율'이 높은 순(내림차순)으로 정렬하여 최적안이 1번에 오도록 배치
         df = pd.DataFrame(results)
         df = df.sort_values(by='소재이용율(%)', ascending=False).reset_index(drop=True)
         max_util = df['소재이용율(%)'].max()
@@ -409,7 +408,8 @@ else:
     rec_bridge, rec_margin = max(1.5, 1.5 * material_thickness), max(2.0, 1.8 * material_thickness)
 
 st.sidebar.header("📏 2. 배열 간격 (다이 강도 고려)")
-bridge = st.sidebar.number_input("최소 브릿지 (mm)", value=float(round(rec_bridge, 1)), step=0.1)
+# ⭐ 변경됨: "최소 브릿지" -> "부품간 최소 간격"
+bridge = st.sidebar.number_input("부품간 최소 간격 (mm)", value=float(round(rec_bridge, 1)), step=0.1)
 margin = st.sidebar.number_input("가장자리 마진 (mm)", value=float(round(rec_margin, 1)), step=0.1)
 
 st.sidebar.header("🔧 3. 캐리어 & 파일럿 설계")
@@ -606,7 +606,10 @@ if uploaded_file is not None:
     part_length_tuned = maxx - minx
     total_length_tuned = (tune_pitch * (total_stations - 1)) + part_length_tuned + (tune_pitch * 0.4)
     x_shift = -minx + (tune_pitch * 0.2)
-    y_shift = -miny + margin + carrier_width
+    
+    orig_all_geom = target_best['parts'][0] if len(target_best['parts']) == 1 else unary_union(target_best['parts'])
+    orig_miny = orig_all_geom.bounds[1]
+    y_shift = -orig_miny + margin + carrier_width + ((tune_width - target_best['w']) / 2)
 
     fig_tune, ax_tune = plt.subplots(figsize=(max(8, total_stations * 2), 4))
     
