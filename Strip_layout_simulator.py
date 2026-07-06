@@ -293,11 +293,21 @@ def render_case_column(col, label, results, best, used_fallback, colors, margin,
         st.pyplot(fig)
 
         df = pd.DataFrame(results)  
-        max_util = df['소재이용율(%)'].max()
         
+        # ⭐ 버그 수정 1: 최적안(best)이 항상 맨 위에 오도록 정렬 순서 강제
+        df['is_chosen'] = df['각도'] == f"{best['angle']}°"
+        # 선택된 최적안을 무조건 1순위로 올리고, 그 다음은 이용율 내림차순으로 정렬
+        df = df.sort_values(by=['is_chosen', '소재이용율(%)'], ascending=[False, False]).reset_index(drop=True)
+        df = df.drop(columns=['is_chosen'])
+        
+        # ⭐ 버그 수정 2: 하이라이트 조건을 '단순히 높은 이용율'이 아니라 '선택된 최적안'으로 명확히 변경
         def highlight(row):
-            if row['압연방향 적합'] == 'X': return ['background-color: #ffe6e6;'] * len(row)
-            if row['소재이용율(%)'] == max_util: return ['color: blue; font-weight: bold; background-color: #e6f2ff;'] * len(row)
+            is_chosen = (row['각도'] == f"{best['angle']}°")
+            if is_chosen: 
+                # 프로그램이 뽑아낸 최종 최적안은 압연제약 무시(Fallback) 상태라도 파란색 볼드로 표시
+                return ['color: blue; font-weight: bold; background-color: #e6f2ff;'] * len(row)
+            if row['압연방향 적합'] == 'X': 
+                return ['background-color: #ffe6e6;'] * len(row)
             return [''] * len(row)
             
         st.dataframe(df.style.apply(highlight, axis=1).format({'피치(mm)': '{:.2f}', '소재폭(mm)': '{:.2f}', '소재이용율(%)': '{:.2f}'}), use_container_width=True)
@@ -451,7 +461,6 @@ min_angle_from_rolling = st.sidebar.number_input("최소 이격각 (°, 통상 3
 # ============================================================
 # [6] 메인 화면 동작 및 결과 캐싱 로직
 # ============================================================
-# ⭐ DXF 파일 업로드 섹션에 사용자 안내 문구 추가
 st.markdown("#### 📂 도면 업로드")
 st.info("💡 **DXF 업로드 시 주의사항:** 정확한 계산을 위해 제품의 외곽선과 내부 피어싱 홀들은 반드시 각각 하나의 **'닫힌 폴리라인(Closed Polyline)'**으로 연결되어 있어야 합니다. (CAD에서 `JOIN` 또는 `REGION` 명령어로 결합 후 저장)")
 uploaded_file = st.file_uploader("DXF 전개도면을 업로드하세요.", type=['dxf'])
