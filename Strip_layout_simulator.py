@@ -74,7 +74,7 @@ def get_unit_factor(doc):
 
 
 # ============================================================
-# [1] 핵심 알고리즘 (초정밀 파고들기 스캔 적용)
+# [1] 핵심 알고리즘 (⭐ 전면 개편: 초정밀 파고들기 스캔 적용)
 # ============================================================
 def calculate_1d_pitch(geom, bridge):
     minx, miny, maxx, maxy = geom.bounds
@@ -101,10 +101,15 @@ def calculate_1d_pitch(geom, bridge):
     return dx
 
 def find_nesting_offset(part_a, part_b, p_base, bridge):
+    """
+    1열(Base Row)의 틈새로 2열(part_b)이 최대한 파고들 수 있는 (dx, dy) 오프셋을 찾습니다.
+    탐색 해상도 90단계로 미세한 스태거(Stagger) 위치를 완벽하게 찾아냅니다.
+    """
     buffered_a = part_a.buffer(bridge, resolution=4)
     minx, miny, maxx, maxy = part_a.bounds
     w, h = maxx - minx, maxy - miny
 
+    # 무한히 반복되는 1열 라인 생성 (충돌 검증용)
     reps = int(np.ceil((maxx - minx + p_base) / p_base)) + 2
     base_geoms = [translate(buffered_a, xoff=i*p_base, yoff=0) for i in range(-2, reps+1)]
     base_row = unary_union(base_geoms)
@@ -112,25 +117,28 @@ def find_nesting_offset(part_a, part_b, p_base, bridge):
     best_dx, best_dy = 0, float('inf')
     best_part_b = None
 
+    # X축으로 90번 촘촘하게 찔러보며 가장 깊숙이 들어가는 위치 탐색
     for dx in np.linspace(0, p_base, 90):
-        dy = h + bridge * 2  
-        step = max(0.5, min(h / 20, bridge / 2)) 
+        dy = h + bridge * 2  # 위에서부터 안전하게 하강 시작
+        step = max(0.5, min(h / 20, bridge / 2)) # 좁은 틈을 건너뛰지 않는 세밀한 하강 스텝
         test_b = translate(part_b, xoff=dx, yoff=dy)
 
+        # 1차 스텝 하강 (거친 탐색)
         while not base_row.intersects(test_b):
             dy -= step
             if dy < -h * 1.5: break 
             test_b = translate(part_b, xoff=dx, yoff=dy)
 
-        dy += step 
+        dy += step # 충돌 직전으로 백스텝
         fine_step = step / 10
         test_b = translate(part_b, xoff=dx, yoff=dy)
 
+        # 2차 스텝 하강 (초정밀 탐색)
         while not base_row.intersects(test_b):
             dy -= fine_step
             if dy < -h * 1.5: break
             test_b = translate(part_b, xoff=dx, yoff=dy)
-        dy += fine_step 
+        dy += fine_step # 최종 안착 위치 확정
 
         if dy < best_dy:
             best_dy = dy
@@ -200,45 +208,8 @@ def plot_polygon(ax, poly, color, lw=1.5, alpha=0.5):
 
 
 # ============================================================
-# [3] 배열 각도 스캔 공통 로직
+# [3] UI 및 렌더링 헬퍼 함수
 # ============================================================
-def analyze_case(base_parts, origin, area_for_util, cost_divisor, bridge, margin, carrier_width,
-                  material_thickness, material_density, material_price, check_rolling, bend_line_angles, min_angle_from_rolling, angle_step):
-    results, best, fallback_best = [], None, None
-
-    for angle in range(0, 180, angle_step):
-        rotated = [rotate(g, angle, origin=origin) for g in base_parts]
-        unioned = rotated[0] if len(rotated) == 1 else unary_union(rotated)
-
-        p_val = calculate_1d_pitch(unioned, bridge)
-        minx, miny, maxx, maxy = unioned.bounds
-        w_val = (maxy - miny) + margin * 2 + carrier_width * 2
-        util = (area_for_util / (p_val * w_val)) * 100
-        cost = (((p_val * w_val * material_thickness) * material_density) / 1_000_000) * material_price / cost_divisor
-
-        valid = True
-        if check_rolling:
-            for b_angle in bend_line_angles:
-                eff_angle = (b_angle + angle) % 180
-                dist_from_parallel = min(eff_angle, 180 - eff_angle)
-                if dist_from_parallel < min_angle_from_rolling:
-                    valid = False
-                    break 
-
-        results.append({
-            '각도': f"{angle}°", '피치(mm)': round(p_val, 2), '소재폭(mm)': round(w_val, 2),
-            '소재이용율(%)': round(util, 2), '1개당 원가(원)': int(cost), '압연방향 적합': 'O' if valid else 'X',
-        })
-
-        record = {'util': util, 'cost': cost, 'angle': angle, 'parts': rotated, 'w': w_val, 'p': p_val}
-        if fallback_best is None or util > fallback_best['util']: fallback_best = record
-        if valid and (best is None or util > best['util']): best = record
-
-    used_fallback = best is None
-    if best is None: best = fallback_best
-    return results, best, used_fallback
-
-
 def render_case_column(col, label, results, best, used_fallback, colors, margin, carrier_width):
     with col:
         st.subheader(f"{label} ({best['angle']}°)")
@@ -283,15 +254,12 @@ def render_case_column(col, label, results, best, used_fallback, colors, margin,
 # ============================================================
 def plot_strip_layout(parts_and_colors, pitch, part_zone_width, margin, carrier_width, pilot_dia, total_stations):
     strip_width = part_zone_width + carrier_width * 2
-    
     all_geoms = unary_union([p[0] for p in parts_and_colors])
     minx, miny, maxx, maxy = all_geoms.bounds
     part_length = maxx - minx
-    
     total_length = (pitch * (total_stations - 1)) + part_length + (pitch * 0.4)
 
     fig, ax = plt.subplots(figsize=(max(8, total_stations * 2), 4))
-
     ax.plot([0, total_length, total_length, 0, 0], [0, 0, strip_width, strip_width, 0],
             color='red', linestyle='-', linewidth=2.5,
             label=f'금형 코어 최소 사이즈\n(가로: {total_length:.1f} x 세로: {strip_width:.1f})')
@@ -312,8 +280,7 @@ def plot_strip_layout(parts_and_colors, pitch, part_zone_width, margin, carrier_
         if i < total_stations - 1:
             ax.plot([pitch * (i + 1), pitch * (i + 1)], [0, strip_width], color='black', linestyle=':', alpha=0.4, zorder=1)
 
-    ax.axis('equal')
-    ax.set_xticks([]); ax.set_yticks([])
+    ax.axis('equal'); ax.set_xticks([]); ax.set_yticks([])
     ax.legend(loc='center left', bbox_to_anchor=(1.02, 0.5))
     plt.tight_layout()
     return fig
@@ -322,7 +289,6 @@ def render_strip_section(label, best, total_stations, margin, carrier_width, pil
     all_geoms = best['parts'][0] if len(best['parts']) == 1 else unary_union(best['parts'])
     minx, miny, maxx, maxy = all_geoms.bounds
     part_length = maxx - minx
-    
     l_val = (best['p'] * (total_stations - 1)) + part_length + (best['p'] * 0.4)
     
     st.info(f"📐 **{label} 금형 코어 최소 사이즈:** 가로(L) :blue[**{l_val:.1f} mm**] × 세로(W) :blue[**{best['w']:.1f} mm**] (캐리어 {carrier_width}mm 포함)  |  피치(P) :blue[**{best['p']:.2f} mm**] × **{total_stations}**스테이션")
@@ -333,7 +299,6 @@ def render_strip_section(label, best, total_stations, margin, carrier_width, pil
 def generate_dxf_bytes(tuned_parts, tune_pitch, tune_width, total_stations, margin, carrier_width, pilot_dia, x_shift, y_shift):
     doc = ezdxf.new('R2010')
     msp = doc.modelspace()
-    
     doc.layers.add("STRIP_EDGE", color=1)
     doc.layers.add("PARTS", color=7)
     doc.layers.add("PILOT_HOLES", color=5)
@@ -348,34 +313,24 @@ def generate_dxf_bytes(tuned_parts, tune_pitch, tune_width, total_stations, marg
     
     def add_poly_to_msp(poly, layer_name):
         if poly.geom_type == 'MultiPolygon':
-            for p in poly.geoms:
-                add_poly_to_msp(p, layer_name)
+            for p in poly.geoms: add_poly_to_msp(p, layer_name)
             return
-        
-        ext_coords = list(poly.exterior.coords)
-        msp.add_lwpolyline(ext_coords, dxfattribs={'layer': layer_name, 'closed': True})
-        
+        msp.add_lwpolyline(list(poly.exterior.coords), dxfattribs={'layer': layer_name, 'closed': True})
         for interior in poly.interiors:
-            int_coords = list(interior.coords)
-            msp.add_lwpolyline(int_coords, dxfattribs={'layer': layer_name, 'closed': True})
+            msp.add_lwpolyline(list(interior.coords), dxfattribs={'layer': layer_name, 'closed': True})
 
     for i in range(total_stations):
         for geom in tuned_parts:
             shifted = translate(geom, xoff=x_shift + (i * tune_pitch), yoff=y_shift)
             add_poly_to_msp(shifted, "PARTS")
-
         if carrier_width > 0 and 0 < pilot_dia < carrier_width:
-            cx = tune_pitch * (i + 0.5)
-            cy = carrier_width / 2
+            cx, cy = tune_pitch * (i + 0.5), carrier_width / 2
             msp.add_circle(center=(cx, cy), radius=pilot_dia / 2, dxfattribs={'layer': 'PILOT_HOLES'})
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp:
         doc.saveas(tmp.name)
         tmp_path = tmp.name
-        
-    with open(tmp_path, "rb") as f:
-        dxf_bytes = f.read()
-        
+    with open(tmp_path, "rb") as f: dxf_bytes = f.read()
     os.remove(tmp_path)
     return dxf_bytes
 
@@ -419,8 +374,7 @@ st.sidebar.info(f"**총 예상 스테이션: {total_stations} 피치**")
 
 st.sidebar.header("🧭 5. 압연방향(그레인) 제약")
 apply_rolling_constraint = st.sidebar.checkbox("벤딩 라인 - 압연방향 최소 이격각 적용", value=(st_bend > 0), help="프레스 피드 방향(=압연방향, 도면 X축과 평행)과 벤딩 라인이 너무 나란하면 성형 시 크랙 위험이 커집니다.")
-
-bend_angles_input = st.sidebar.text_input("벤딩 라인 각도 (°, 쉼표로 다중 입력)", value="0", disabled=not apply_rolling_constraint, help="예시: 단일 벤딩은 '0', 4면 직교 벤딩은 '0, 90'과 같이 쉼표로 구분하여 입력하세요.")
+bend_angles_input = st.sidebar.text_input("벤딩 라인 각도 (°, 쉼표로 다중 입력)", value="0", disabled=not apply_rolling_constraint)
 min_angle_from_rolling = st.sidebar.number_input("최소 이격각 (°, 통상 30~45° 권장)", value=30.0, step=5.0, disabled=not apply_rolling_constraint)
 
 bend_line_angles = []
@@ -454,13 +408,9 @@ current_params = (
 if 'last_params' not in st.session_state:
     st.session_state.last_params = None
 
-# ⭐ 버그수정: 재계산 플래그 추가 (사이드바 변동 감지용)
-recalculated = False
-
 if uploaded_file is not None:
     if st.session_state.last_params != current_params:
-        recalculated = True  # 재계산 발생 플래그 활성화
-        with st.spinner('안전 간격 적용 및 초정밀 형상 파고들기(Staggering)를 분석 중입니다...'):
+        with st.spinner('안전 간격 적용 및 초정밀 형상 파고들기(Staggering)를 분석 중입니다... (약 10~20초 소요)'):
             with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp:
                 tmp.write(uploaded_file.getvalue())
                 tmp_path = tmp.name
@@ -485,10 +435,12 @@ if uploaded_file is not None:
             best_s = best_i = best_z = None
             fallback_s = fallback_i = fallback_z = None
 
+            # ⭐ 메인 루프: 매 각도마다 회전시킨 후 파고들기 오프셋을 철저하게 재계산
             for angle in range(0, 180, angle_step):
                 rotated_part = rotate(part, angle, origin='centroid')
                 p_base = calculate_1d_pitch(rotated_part, bridge)
 
+                # 압연방향 제약 검사
                 valid = True
                 if apply_rolling_constraint:
                     for b_angle in bend_line_angles:
@@ -510,7 +462,7 @@ if uploaded_file is not None:
                 if fallback_s is None or util_s > fallback_s['util']: fallback_s = record_s
                 if valid and (best_s is None or util_s > best_s['util']): best_s = record_s
 
-                # [2] 180도 교차 배열 계산
+                # [2] 180도 교차 배열 계산 (새로운 파고들기 엔진 적용)
                 part_180 = rotate(rotated_part, 180, origin='centroid')
                 dx_i, dy_i, geom_i, part_b_i = find_nesting_offset(rotated_part, part_180, p_base, bridge)
                 if part_b_i:
@@ -525,7 +477,7 @@ if uploaded_file is not None:
                     if fallback_i is None or util_i > fallback_i['util']: fallback_i = record_i
                     if valid and (best_i is None or util_i > best_i['util']): best_i = record_i
 
-                # [3] 지그재그 배열 계산
+                # [3] 지그재그 배열 계산 (새로운 파고들기 엔진 적용)
                 part_same = rotated_part
                 dx_z, dy_z, geom_z, part_b_z = find_nesting_offset(rotated_part, part_same, p_base, bridge)
                 if part_b_z:
@@ -630,8 +582,7 @@ if uploaded_file is not None:
 
     tkey = tune_target_name
 
-    # ⭐ 버그수정: 재계산(recalculated)이 일어났거나, 배열 타겟(tune_target_name)이 바뀌면 초기화
-    if st.session_state.last_tune_target != tune_target_name or recalculated:
+    if st.session_state.last_tune_target != tune_target_name:
         st.session_state[f"tune_angle_{tkey}"] = float(target_best['angle'])
         st.session_state[f"tune_pitch_{tkey}"] = float(target_best['p'])
         st.session_state[f"tune_width_{tkey}"] = float(target_best['w'])
