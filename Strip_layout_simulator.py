@@ -439,12 +439,10 @@ st_final_notch = st.sidebar.number_input("노칭 (최종 낙하)", value=1, step
 st_idle = st.sidebar.number_input("아이들 피치 (빈 구간)", value=1, step=1)
 st_simul = st.sidebar.number_input("➖ 동시 성형 (중복 차감)", value=0, step=1)
 
-# 총 스테이션 계산식에 벤딩, 포밍, 노칭 항목 분리 적용
 total_stations = max(1, int((st_notch + st_pierce + st_bend + st_form + st_final_notch + st_idle) - st_simul))
 st.sidebar.info(f"**총 예상 스테이션: {total_stations} 피치**")
 
 st.sidebar.header("🧭 5. 압연방향(그레인) 제약")
-# 벤딩 값이 0 이상일 때만 자동 체크되도록 수정
 apply_rolling_constraint = st.sidebar.checkbox("벤딩 라인 - 압연방향 최소 이격각 적용", value=(st_bend > 0), help="프레스 피드 방향(=압연방향, 도면 X축과 평행)과 벤딩 라인이 너무 나란하면 성형 시 크랙 위험이 커집니다.")
 bend_line_angle = st.sidebar.number_input("부품 좌표계 기준 벤딩 라인 각도 (°, 0=부품 X축과 평행)", value=0.0, step=5.0, disabled=not apply_rolling_constraint)
 min_angle_from_rolling = st.sidebar.number_input("최소 이격각 (°, 통상 30~45° 권장)", value=30.0, step=5.0, disabled=not apply_rolling_constraint)
@@ -453,6 +451,9 @@ min_angle_from_rolling = st.sidebar.number_input("최소 이격각 (°, 통상 3
 # ============================================================
 # [6] 메인 화면 동작 및 결과 캐싱 로직
 # ============================================================
+# ⭐ DXF 파일 업로드 섹션에 사용자 안내 문구 추가
+st.markdown("#### 📂 도면 업로드")
+st.info("💡 **DXF 업로드 시 주의사항:** 정확한 계산을 위해 제품의 외곽선과 내부 피어싱 홀들은 반드시 각각 하나의 **'닫힌 폴리라인(Closed Polyline)'**으로 연결되어 있어야 합니다. (CAD에서 `JOIN` 또는 `REGION` 명령어로 결합 후 저장)")
 uploaded_file = st.file_uploader("DXF 전개도면을 업로드하세요.", type=['dxf'])
 
 file_hash = hashlib.md5(uploaded_file.getvalue()).hexdigest() if uploaded_file else None
