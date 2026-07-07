@@ -15,6 +15,8 @@ import tempfile
 import os
 import glob
 import hashlib
+import io
+from matplotlib.backends.backend_pdf import PdfPages
 
 
 # ============================================================
@@ -156,7 +158,6 @@ def read_part_with_holes(msp, unit_factor):
 
             poly = Polygon(coords).buffer(0)
             
-            # ⭐ 버그수정: 끝점 일치 검사를 폐기하고, 면적이 거의 없는 선(Line) 찌꺼기만 필터링
             if poly.is_empty or poly.area < 1e-4: 
                 continue
                 
@@ -284,7 +285,7 @@ def render_case_column(col, label, results, best, used_fallback, colors, margin,
 
 
 # ============================================================
-# [4] 스트립 Layout도 렌더링 및 DXF Export
+# [4] 데이터 추출 헬퍼 함수 (DXF / Excel / PDF)
 # ============================================================
 def plot_strip_layout(parts_and_colors, pitch, part_zone_width, margin, carrier_width, pilot_dia, total_stations):
     strip_width = part_zone_width + carrier_width * 2
@@ -369,6 +370,72 @@ def generate_dxf_bytes(tuned_parts, tune_pitch, tune_width, total_stations, marg
     with open(tmp_path, "rb") as f: dxf_bytes = f.read()
     os.remove(tmp_path)
     return dxf_bytes
+
+# ⭐ 추가: 엑셀 리포트 추출 함수
+def generate_excel_report(best_method_name, tune_pitch, tune_width, tune_util, tune_cost, total_stations, mat_type, material_thickness, material_price, material_density, s_res, i_res, z_res):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        summary_df = pd.DataFrame({
+            "항목": ["채택된 배열 방식", "소재 분류", "소재 두께 (t)", "소재 비중", "단가 (원/kg)", "총 스테이션 수", "최종 피치 (mm)", "최종 소재 폭 (mm)", "최종 소재이용율 (%)", "최종 1개당 단가 (원)"],
+            "값": [best_method_name, mat_type, material_thickness, material_density, material_price, total_stations, tune_pitch, tune_width, f"{tune_util:.2f}", int(tune_cost)]
+        })
+        summary_df.to_excel(writer, sheet_name="최종 요약", index=False)
+        
+        all_dfs = []
+        if s_res: 
+            df_s = pd.DataFrame(s_res)
+            df_s.insert(0, '배열 방식', '단일 배열')
+            all_dfs.append(df_s)
+        if i_res: 
+            df_i = pd.DataFrame(i_res)
+            df_i.insert(0, '배열 방식', '180도 교차 배열')
+            all_dfs.append(df_i)
+        if z_res: 
+            df_z = pd.DataFrame(z_res)
+            df_z.insert(0, '배열 방식', '지그재그 배열')
+            all_dfs.append(df_z)
+            
+        if all_dfs:
+            combined_df = pd.concat(all_dfs, ignore_index=True)
+            combined_df.to_excel(writer, sheet_name="전체 시뮬레이션 데이터", index=False)
+            
+    return output.getvalue()
+
+# ⭐ 추가: PDF 리포트 추출 함수
+def generate_pdf_report(fig_layout, best_method_name, tune_pitch, tune_width, tune_util, tune_cost, total_stations, mat_type, material_thickness):
+    pdf_buf = io.BytesIO()
+    with PdfPages(pdf_buf) as pdf:
+        # 1페이지: 요약 텍스트
+        fig_text, ax_text = plt.subplots(figsize=(8, 5))
+        ax_text.axis('off')
+        
+        title_font = {'fontsize': 16, 'fontweight': 'bold'}
+        body_font = {'fontsize': 12}
+        
+        summary_text = (
+            f"■ 소재 정보\n"
+            f" - 분류: {mat_type}\n"
+            f" - 두께: {material_thickness} t\n\n"
+            f"■ 레이아웃 설계 결과\n"
+            f" - 채택 배열: {best_method_name}\n"
+            f" - 총 공정수: {total_stations} 스테이션\n"
+            f" - 결정 피치: {tune_pitch:.2f} mm\n"
+            f" - 결정 폭: {tune_width:.2f} mm\n\n"
+            f"■ 최종 산출물\n"
+            f" - 소재이용율: {tune_util:.2f} %\n"
+            f" - 1개당 예상 단가: {int(tune_cost):,} 원\n"
+        )
+        
+        ax_text.text(0.05, 0.95, "프레스 레이아웃 시뮬레이션 리포트", fontdict=title_font, va='top')
+        ax_text.text(0.05, 0.75, summary_text, fontdict=body_font, va='top')
+        
+        pdf.savefig(fig_text)
+        plt.close(fig_text)
+        
+        # 2페이지: 레이아웃 도면 (현재 미세조정 화면에 표시된 이미지 그대로)
+        pdf.savefig(fig_layout)
+        
+    return pdf_buf.getvalue()
 
 
 # ============================================================
@@ -743,28 +810,40 @@ if uploaded_file is not None:
     st.pyplot(fig_tune)
 
     # ============================================================
-    # [8] CAD 작업용 DXF Export 
+    # [8] 데이터 추출 및 내보내기 (DXF / Excel / PDF)
     # ============================================================
     st.divider()
-    st.subheader("💾 [4단계] CAD 도면(DXF) 내보내기")
-    st.markdown("위에서 미세조정을 마친 최종 배열을 CAD(AutoCAD 등)에서 바로 작업할 수 있도록 **DXF 파일로 다운로드**합니다. 레이어 분리(외곽선/제품/파일럿홀)가 적용되어 실무 설계에 즉시 활용 가능합니다.")
+    st.header("💾 [4단계] 데이터 추출 및 내보내기")
+    st.markdown("최종 미세조정(Fine-Tuning)이 완료된 결과를 바탕으로 **CAD 도면(DXF)**, **견적용 데이터(Excel)**, 그리고 **보고용 문서(PDF)**를 다운로드할 수 있습니다.")
     
+    # 각 파일 생성
     dxf_bytes = generate_dxf_bytes(
-        tuned_parts=tuned_parts,
-        tune_pitch=tune_pitch,
-        tune_width=tune_width,
-        total_stations=total_stations,
-        margin=margin,
-        carrier_width=carrier_width,
-        pilot_dia=pilot_dia,
-        x_shift=x_shift,
-        y_shift=y_shift
+        tuned_parts=tuned_parts, tune_pitch=tune_pitch, tune_width=tune_width,
+        total_stations=total_stations, margin=margin, carrier_width=carrier_width,
+        pilot_dia=pilot_dia, x_shift=x_shift, y_shift=y_shift
     )
     
-    st.download_button(
-        label="📥 최종 스트립 레이아웃 DXF 다운로드",
-        data=dxf_bytes,
-        file_name="optimized_strip_layout.dxf",
-        mime="application/dxf",
-        type="primary"
+    excel_bytes = generate_excel_report(
+        tune_target_name, tune_pitch, tune_width, tune_util, tune_cost, 
+        total_stations, mat_type, material_thickness, material_price, material_density,
+        s_res, i_res, z_res
     )
+    
+    pdf_bytes = generate_pdf_report(
+        fig_tune, tune_target_name, tune_pitch, tune_width, tune_util, tune_cost, 
+        total_stations, mat_type, material_thickness
+    )
+    
+    col_dxf, col_xls, col_pdf = st.columns(3)
+    
+    with col_dxf:
+        st.subheader("📐 CAD 도면")
+        st.download_button(label="📥 DXF 다운로드", data=dxf_bytes, file_name="optimized_strip_layout.dxf", mime="application/dxf", type="primary", use_container_width=True)
+        
+    with col_xls:
+        st.subheader("📊 견적용 데이터")
+        st.download_button(label="📥 Excel 다운로드", data=excel_bytes, file_name="layout_report.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary", use_container_width=True)
+        
+    with col_pdf:
+        st.subheader("📄 보고용 문서")
+        st.download_button(label="📥 PDF 다운로드", data=pdf_bytes, file_name="layout_report.pdf", mime="application/pdf", type="primary", use_container_width=True)
