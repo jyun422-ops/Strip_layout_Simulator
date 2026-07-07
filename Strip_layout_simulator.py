@@ -721,4 +721,57 @@ if uploaded_file is not None:
     x_shift = -minx + (tune_pitch * 0.2)
 
     extra_width = max(0.0, tune_width - min_required_width)
-    y_shift = -
+    y_shift = -miny + margin + carrier_width + extra_width / 2
+
+    fig_tune, ax_tune = plt.subplots(figsize=(max(8, total_stations * 2), 4))
+    
+    ax_tune.plot([0, total_length_tuned, total_length_tuned, 0, 0], 
+                 [0, 0, tune_width, tune_width, 0], color='red', linestyle='-', linewidth=2.5,
+                 label=f'조정 후 코어 사이즈\n(가로: {total_length_tuned:.1f} x 세로: {tune_width:.1f} | 피치: {tune_pitch:.2f})')
+    
+    if carrier_width > 0:
+        ax_tune.add_patch(Rectangle((0, 0), total_length_tuned, carrier_width, facecolor='#999999', alpha=0.25, edgecolor='none', zorder=1))
+        ax_tune.add_patch(Rectangle((0, tune_width - carrier_width), total_length_tuned, carrier_width, facecolor='#999999', alpha=0.25, edgecolor='none', zorder=1))
+
+    for i in range(total_stations):
+        for idx, geom in enumerate(tuned_parts):
+            color = ['#004b87', '#007934'][idx] if is_pair else '#004b87'
+            if tune_target_name == '지그재그 배열': color = ['#004b87', '#d55e00'][idx]
+            shifted = translate(geom, xoff=x_shift + (i * tune_pitch), yoff=y_shift)
+            plot_polygon(ax_tune, shifted, color, lw=1.5, alpha=0.7)
+
+        if carrier_width > 0 and 0 < pilot_dia < carrier_width:
+            ax_tune.add_patch(Circle((tune_pitch * (i + 0.5), carrier_width / 2), pilot_dia / 2, facecolor='white', edgecolor='black', linewidth=1.2, zorder=5))
+        if i < total_stations - 1:
+            ax_tune.plot([tune_pitch * (i + 1), tune_pitch * (i + 1)], [0, tune_width], color='black', linestyle=':', alpha=0.4, zorder=1)
+
+    ax_tune.axis('equal'); ax_tune.set_xticks([]); ax_tune.set_yticks([])
+    ax_tune.legend(loc='center left', bbox_to_anchor=(1.02, 0.5))
+    st.pyplot(fig_tune)
+
+    # ============================================================
+    # [8] CAD 작업용 DXF Export 
+    # ============================================================
+    st.divider()
+    st.subheader("💾 [4단계] CAD 도면(DXF) 내보내기")
+    st.markdown("위에서 미세조정을 마친 최종 배열을 CAD(AutoCAD 등)에서 바로 작업할 수 있도록 **DXF 파일로 다운로드**합니다. 레이어 분리(외곽선/제품/파일럿홀)가 적용되어 실무 설계에 즉시 활용 가능합니다.")
+    
+    dxf_bytes = generate_dxf_bytes(
+        tuned_parts=tuned_parts,
+        tune_pitch=tune_pitch,
+        tune_width=tune_width,
+        total_stations=total_stations,
+        margin=margin,
+        carrier_width=carrier_width,
+        pilot_dia=pilot_dia,
+        x_shift=x_shift,
+        y_shift=y_shift
+    )
+    
+    st.download_button(
+        label="📥 최종 스트립 레이아웃 DXF 다운로드",
+        data=dxf_bytes,
+        file_name="optimized_strip_layout.dxf",
+        mime="application/dxf",
+        type="primary"
+    )
