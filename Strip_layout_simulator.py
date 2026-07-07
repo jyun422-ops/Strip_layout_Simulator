@@ -473,7 +473,7 @@ if uploaded_file is not None:
             if part.geom_type == 'MultiPolygon':
                 part = max(part.geoms, key=lambda a: a.area)
                 
-            part_area, part.area, part.area * 2
+            part_area, pair_area = part.area, part.area * 2
 
             single_results, inter_results, zigzag_results = [], [], []
             best_s = best_i = best_z = None
@@ -673,7 +673,6 @@ if uploaded_file is not None:
     all_geom_tuned = tuned_parts[0] if len(tuned_parts) == 1 else unary_union(tuned_parts)
     minx, miny, maxx, maxy = all_geom_tuned.bounds
 
-    # ⭐ 버그수정: 뭉툭한 단일 블록 간섭 계산 폐기, 개별 부품 단위 초정밀 센서 롤백 적용
     interference_tol = 0.01  
     is_clashing = False
     
@@ -685,17 +684,14 @@ if uploaded_file is not None:
             buf_0 = tuned_parts[0].buffer(bridge - interference_tol, resolution=4)
             buf_1 = tuned_parts[1].buffer(bridge - interference_tol, resolution=4)
             
-            # 파트1 vs 파트2 (동일 스테이션)
             if buf_0.intersects(tuned_parts[1]): is_clashing = True
             
-            # 인접 스테이션 (-2, -1, 1, 2 피치) 검사
             for step in [-2, -1, 1, 2]:
                 shift_x = step * tune_pitch
                 if buf_0.intersects(translate(tuned_parts[0], xoff=shift_x, yoff=0)): is_clashing = True
                 if buf_1.intersects(translate(tuned_parts[1], xoff=shift_x, yoff=0)): is_clashing = True
                 if buf_0.intersects(translate(tuned_parts[1], xoff=shift_x, yoff=0)): is_clashing = True
     else:
-        # 단일 배열
         base_min_pitch = calculate_1d_pitch(tuned_parts[0], bridge)
         if tune_pitch < base_min_pitch - interference_tol:
             is_clashing = True
