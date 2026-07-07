@@ -148,11 +148,19 @@ def find_nesting_offset(part_a, part_b, p_base, bridge):
 def read_part_with_holes(msp, unit_factor):
     candidates = []
     flatten_tol = 0.1 if unit_factor == 0 else max(1e-4, 0.05 / unit_factor)
-    for entity in msp.query('LWPOLYLINE POLYLINE'):
+    for entity in msp.query('LWPOLYLINE POLYLINE CIRCLE ELLIPSE SPLINE'):
         try:
+            dxftype = entity.dxftype()
             p = path.make_path(entity)
             coords = [(v.x * unit_factor, v.y * unit_factor) for v in p.flattening(distance=flatten_tol)]
             if len(coords) < 3: continue
+
+            if dxftype not in ('CIRCLE', 'ELLIPSE'):
+                sx, sy = coords[0]
+                ex, ey = coords[-1]
+                if ((sx - ex) ** 2 + (sy - ey) ** 2) ** 0.5 > max(flatten_tol * 5, 1e-2):
+                    continue
+
             poly = Polygon(coords).buffer(0)
             if poly.is_empty: continue
             if poly.geom_type == 'MultiPolygon':
@@ -283,15 +291,12 @@ def render_case_column(col, label, results, best, used_fallback, colors, margin,
 # ============================================================
 def plot_strip_layout(parts_and_colors, pitch, part_zone_width, margin, carrier_width, pilot_dia, total_stations):
     strip_width = part_zone_width + carrier_width * 2
-    
     all_geoms = unary_union([p[0] for p in parts_and_colors])
     minx, miny, maxx, maxy = all_geoms.bounds
     part_length = maxx - minx
-    
     total_length = (pitch * (total_stations - 1)) + part_length + (pitch * 0.4)
 
     fig, ax = plt.subplots(figsize=(max(8, total_stations * 2), 4))
-
     ax.plot([0, total_length, total_length, 0, 0], [0, 0, strip_width, strip_width, 0],
             color='red', linestyle='-', linewidth=2.5,
             label=f'금형 코어 최소 사이즈\n(가로: {total_length:.1f} x 세로: {strip_width:.1f})')
@@ -322,7 +327,6 @@ def render_strip_section(label, best, total_stations, margin, carrier_width, pil
     all_geoms = best['parts'][0] if len(best['parts']) == 1 else unary_union(best['parts'])
     minx, miny, maxx, maxy = all_geoms.bounds
     part_length = maxx - minx
-    
     l_val = (best['p'] * (total_stations - 1)) + part_length + (best['p'] * 0.4)
     
     st.info(f"📐 **{label} 금형 코어 최소 사이즈:** 가로(L) :blue[**{l_val:.1f} mm**] × 세로(W) :blue[**{best['w']:.1f} mm**] (캐리어 {carrier_width}mm 포함)  |  피치(P) :blue[**{best['p']:.2f} mm**] × **{total_stations}**스테이션")
@@ -332,8 +336,8 @@ def render_strip_section(label, best, total_stations, margin, carrier_width, pil
 
 def generate_dxf_bytes(tuned_parts, tune_pitch, tune_width, total_stations, margin, carrier_width, pilot_dia, x_shift, y_shift):
     doc = ezdxf.new('R2010')
+    doc.header['$INSUNITS'] = 4
     msp = doc.modelspace()
-    
     doc.layers.add("STRIP_EDGE", color=1)
     doc.layers.add("PARTS", color=7)
     doc.layers.add("PILOT_HOLES", color=5)
@@ -348,34 +352,24 @@ def generate_dxf_bytes(tuned_parts, tune_pitch, tune_width, total_stations, marg
     
     def add_poly_to_msp(poly, layer_name):
         if poly.geom_type == 'MultiPolygon':
-            for p in poly.geoms:
-                add_poly_to_msp(p, layer_name)
+            for p in poly.geoms: add_poly_to_msp(p, layer_name)
             return
-        
-        ext_coords = list(poly.exterior.coords)
-        msp.add_lwpolyline(ext_coords, dxfattribs={'layer': layer_name, 'closed': True})
-        
+        msp.add_lwpolyline(list(poly.exterior.coords), dxfattribs={'layer': layer_name, 'closed': True})
         for interior in poly.interiors:
-            int_coords = list(interior.coords)
-            msp.add_lwpolyline(int_coords, dxfattribs={'layer': layer_name, 'closed': True})
+            msp.add_lwpolyline(list(interior.coords), dxfattribs={'layer': layer_name, 'closed': True})
 
     for i in range(total_stations):
         for geom in tuned_parts:
             shifted = translate(geom, xoff=x_shift + (i * tune_pitch), yoff=y_shift)
             add_poly_to_msp(shifted, "PARTS")
-
         if carrier_width > 0 and 0 < pilot_dia < carrier_width:
-            cx = tune_pitch * (i + 0.5)
-            cy = carrier_width / 2
+            cx, cy = tune_pitch * (i + 0.5), carrier_width / 2
             msp.add_circle(center=(cx, cy), radius=pilot_dia / 2, dxfattribs={'layer': 'PILOT_HOLES'})
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp:
         doc.saveas(tmp.name)
         tmp_path = tmp.name
-        
-    with open(tmp_path, "rb") as f:
-        dxf_bytes = f.read()
-        
+    with open(tmp_path, "rb") as f: dxf_bytes = f.read()
     os.remove(tmp_path)
     return dxf_bytes
 
@@ -404,6 +398,8 @@ margin = st.sidebar.number_input("가장자리 마진 (mm)", value=float(round(r
 st.sidebar.header("🔧 3. 캐리어 & 파일럿 설계")
 carrier_width = st.sidebar.number_input("캐리어(스켈레톤) 폭 (mm)", value=float(round(max(4.0, 3 * material_thickness), 1)), step=0.5, help="부품을 다음 스테이션으로 이송시키는 스켈레톤 밴드 폭. 스트립 상/하단에 배치됩니다.")
 pilot_dia = st.sidebar.number_input("파일럿 홀 지름 (mm)", value=4.0, step=0.5)
+if not (carrier_width > 0 and 0 < pilot_dia < carrier_width):
+    st.sidebar.caption("⚠️ 파일럿 홀 지름이 캐리어 폭보다 크거나 같아 Layout도에 표시되지 않습니다.")
 
 st.sidebar.header("🛠️ 4. Layout도 설계")
 st_notch = st.sidebar.number_input("노칭 / 파이롯트 홀", value=1, step=1)
@@ -419,8 +415,7 @@ st.sidebar.info(f"**총 예상 스테이션: {total_stations} 피치**")
 
 st.sidebar.header("🧭 5. 압연방향(그레인) 제약")
 apply_rolling_constraint = st.sidebar.checkbox("벤딩 라인 - 압연방향 최소 이격각 적용", value=(st_bend > 0), help="프레스 피드 방향(=압연방향, 도면 X축과 평행)과 벤딩 라인이 너무 나란하면 성형 시 크랙 위험이 커집니다.")
-
-bend_angles_input = st.sidebar.text_input("벤딩 라인 각도 (°, 쉼표로 다중 입력)", value="0", disabled=not apply_rolling_constraint, help="예시: 단일 벤딩은 '0', 4면 직교 벤딩은 '0, 90'과 같이 쉼표로 구분하여 입력하세요.")
+bend_angles_input = st.sidebar.text_input("벤딩 라인 각도 (°, 쉼표로 다중 입력)", value="0", disabled=not apply_rolling_constraint)
 min_angle_from_rolling = st.sidebar.number_input("최소 이격각 (°, 통상 30~45° 권장)", value=30.0, step=5.0, disabled=not apply_rolling_constraint)
 
 bend_line_angles = []
@@ -454,12 +449,11 @@ current_params = (
 if 'last_params' not in st.session_state:
     st.session_state.last_params = None
 
-# ⭐ 버그수정: 재계산 플래그 추가 (사이드바 변동 감지용)
 recalculated = False
 
 if uploaded_file is not None:
     if st.session_state.last_params != current_params:
-        recalculated = True  # 재계산 발생 플래그 활성화
+        recalculated = True 
         with st.spinner('안전 간격 적용 및 초정밀 형상 파고들기(Staggering)를 분석 중입니다...'):
             with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp:
                 tmp.write(uploaded_file.getvalue())
@@ -479,7 +473,7 @@ if uploaded_file is not None:
             if part.geom_type == 'MultiPolygon':
                 part = max(part.geoms, key=lambda a: a.area)
                 
-            part_area, pair_area = part.area, part.area * 2
+            part_area, part.area, part.area * 2
 
             single_results, inter_results, zigzag_results = [], [], []
             best_s = best_i = best_z = None
@@ -623,22 +617,28 @@ if uploaded_file is not None:
 
     if 'last_tune_target' not in st.session_state:
         st.session_state.last_tune_target = None
-        
-    tune_target_name = st.selectbox("조정할 배열 방식 선택", options=[k for k, v in candidates], index=[k for k, v in candidates].index(best_method_name))
+
+    valid_option_names = [k for k, v in candidates]
+
+    if ('tune_target_select' not in st.session_state
+            or st.session_state['tune_target_select'] not in valid_option_names):
+        st.session_state['tune_target_select'] = best_method_name
+
+    tune_target_name = st.selectbox("조정할 배열 방식 선택", options=valid_option_names, key='tune_target_select')
     target_best = next(v for k, v in candidates if k == tune_target_name)
     is_pair = tune_target_name != '단일 배열'
 
     tkey = tune_target_name
 
-    # ⭐ 버그수정: 재계산(recalculated)이 일어났거나, 배열 타겟(tune_target_name)이 바뀌면 초기화
-    if st.session_state.last_tune_target != tune_target_name or recalculated:
+    tune_reset_signature = (file_hash, tune_target_name)
+    if st.session_state.last_tune_target != tune_reset_signature or recalculated:
         st.session_state[f"tune_angle_{tkey}"] = float(target_best['angle'])
         st.session_state[f"tune_pitch_{tkey}"] = float(target_best['p'])
         st.session_state[f"tune_width_{tkey}"] = float(target_best['w'])
         st.session_state[f"tune_y1_{tkey}"] = 0.0
         st.session_state[f"tune_y2_{tkey}"] = 0.0
         st.session_state[f"tune_x2_{tkey}"] = 0.0
-        st.session_state.last_tune_target = tune_target_name
+        st.session_state.last_tune_target = tune_reset_signature
 
     fc1, fc2 = st.columns(2)
     with fc1:
@@ -673,14 +673,37 @@ if uploaded_file is not None:
     all_geom_tuned = tuned_parts[0] if len(tuned_parts) == 1 else unary_union(tuned_parts)
     minx, miny, maxx, maxy = all_geom_tuned.bounds
 
-    min_required_pitch = calculate_1d_pitch(all_geom_tuned, bridge)
-    min_required_width = (maxy - miny) + margin * 2 + carrier_width * 2
+    # ⭐ 버그수정: 뭉툭한 단일 블록 간섭 계산 폐기, 개별 부품 단위 초정밀 센서 롤백 적용
     interference_tol = 0.01  
+    is_clashing = False
+    
+    if is_pair:
+        base_min_pitch = calculate_1d_pitch(tuned_parts[0], bridge)
+        if tune_pitch < base_min_pitch - interference_tol:
+            is_clashing = True
+        else:
+            buf_0 = tuned_parts[0].buffer(bridge - interference_tol, resolution=4)
+            buf_1 = tuned_parts[1].buffer(bridge - interference_tol, resolution=4)
+            
+            # 파트1 vs 파트2 (동일 스테이션)
+            if buf_0.intersects(tuned_parts[1]): is_clashing = True
+            
+            # 인접 스테이션 (-2, -1, 1, 2 피치) 검사
+            for step in [-2, -1, 1, 2]:
+                shift_x = step * tune_pitch
+                if buf_0.intersects(translate(tuned_parts[0], xoff=shift_x, yoff=0)): is_clashing = True
+                if buf_1.intersects(translate(tuned_parts[1], xoff=shift_x, yoff=0)): is_clashing = True
+                if buf_0.intersects(translate(tuned_parts[1], xoff=shift_x, yoff=0)): is_clashing = True
+    else:
+        # 단일 배열
+        base_min_pitch = calculate_1d_pitch(tuned_parts[0], bridge)
+        if tune_pitch < base_min_pitch - interference_tol:
+            is_clashing = True
 
-    if tune_pitch < min_required_pitch - interference_tol:
-        st.error(f"🚫 **간섭 경고:** 현재 피치({tune_pitch:.2f}mm)가 이 각도/오프셋에서 필요한 "
-                 f"최소 피치({min_required_pitch:.2f}mm)보다 작습니다. 인접 스테이션과 부품이 겹치거나 "
-                 f"최소 간격을 침범할 수 있습니다. 피치를 늘리거나 각도/오프셋을 조정하세요.")
+    if is_clashing:
+        st.error(f"🚫 **간섭 경고:** 현재 설정된 피치({tune_pitch:.2f}mm) 또는 오프셋 위치에서는 인접한 부품끼리 겹치거나 최소 브릿지 간격({bridge}mm)을 침범합니다. 값을 넉넉하게 조정하세요.")
+        
+    min_required_width = (maxy - miny) + margin * 2 + carrier_width * 2
     if tune_width < min_required_width - interference_tol:
         st.error(f"🚫 **폭 부족 경고:** 현재 소재 폭({tune_width:.2f}mm)이 이 형상을 담기 위한 "
                  f"최소 폭({min_required_width:.2f}mm)보다 작습니다. 부품이 마진/캐리어 영역을 벗어날 수 있습니다.")
@@ -698,57 +721,4 @@ if uploaded_file is not None:
     x_shift = -minx + (tune_pitch * 0.2)
 
     extra_width = max(0.0, tune_width - min_required_width)
-    y_shift = -miny + margin + carrier_width + extra_width / 2
-
-    fig_tune, ax_tune = plt.subplots(figsize=(max(8, total_stations * 2), 4))
-    
-    ax_tune.plot([0, total_length_tuned, total_length_tuned, 0, 0], 
-                 [0, 0, tune_width, tune_width, 0], color='red', linestyle='-', linewidth=2.5,
-                 label=f'조정 후 코어 사이즈\n(가로: {total_length_tuned:.1f} x 세로: {tune_width:.1f} | 피치: {tune_pitch:.2f})')
-    
-    if carrier_width > 0:
-        ax_tune.add_patch(Rectangle((0, 0), total_length_tuned, carrier_width, facecolor='#999999', alpha=0.25, edgecolor='none', zorder=1))
-        ax_tune.add_patch(Rectangle((0, tune_width - carrier_width), total_length_tuned, carrier_width, facecolor='#999999', alpha=0.25, edgecolor='none', zorder=1))
-
-    for i in range(total_stations):
-        for idx, geom in enumerate(tuned_parts):
-            color = ['#004b87', '#007934'][idx] if is_pair else '#004b87'
-            if tune_target_name == '지그재그 배열': color = ['#004b87', '#d55e00'][idx]
-            shifted = translate(geom, xoff=x_shift + (i * tune_pitch), yoff=y_shift)
-            plot_polygon(ax_tune, shifted, color, lw=1.5, alpha=0.7)
-
-        if carrier_width > 0 and 0 < pilot_dia < carrier_width:
-            ax_tune.add_patch(Circle((tune_pitch * (i + 0.5), carrier_width / 2), pilot_dia / 2, facecolor='white', edgecolor='black', linewidth=1.2, zorder=5))
-        if i < total_stations - 1:
-            ax_tune.plot([tune_pitch * (i + 1), tune_pitch * (i + 1)], [0, tune_width], color='black', linestyle=':', alpha=0.4, zorder=1)
-
-    ax_tune.axis('equal'); ax_tune.set_xticks([]); ax_tune.set_yticks([])
-    ax_tune.legend(loc='center left', bbox_to_anchor=(1.02, 0.5))
-    st.pyplot(fig_tune)
-
-    # ============================================================
-    # [8] CAD 작업용 DXF Export 
-    # ============================================================
-    st.divider()
-    st.subheader("💾 [4단계] CAD 도면(DXF) 내보내기")
-    st.markdown("위에서 미세조정을 마친 최종 배열을 CAD(AutoCAD 등)에서 바로 작업할 수 있도록 **DXF 파일로 다운로드**합니다. 레이어 분리(외곽선/제품/파일럿홀)가 적용되어 실무 설계에 즉시 활용 가능합니다.")
-    
-    dxf_bytes = generate_dxf_bytes(
-        tuned_parts=tuned_parts,
-        tune_pitch=tune_pitch,
-        tune_width=tune_width,
-        total_stations=total_stations,
-        margin=margin,
-        carrier_width=carrier_width,
-        pilot_dia=pilot_dia,
-        x_shift=x_shift,
-        y_shift=y_shift
-    )
-    
-    st.download_button(
-        label="📥 최종 스트립 레이아웃 DXF 다운로드",
-        data=dxf_bytes,
-        file_name="optimized_strip_layout.dxf",
-        mime="application/dxf",
-        type="primary"
-    )
+    y_shift = -
