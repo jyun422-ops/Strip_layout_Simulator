@@ -379,4 +379,392 @@ st.title("⚙️ 프로그레시브 금형 스트립 설계 시뮬레이터")
 
 st.sidebar.header("📝 1. 소재 조건 입력")
 mat_type = st.sidebar.radio("소재 특성 분류", ["일반 철강/연질 (SPCC, AL 등)", "고장력강/경질 (STS, SUS 등)"])
-material_thickness = st.sidebar.number_input("소재 두께 (t)", value=1.2
+material_thickness = st.sidebar.number_input("소재 두께 (t)", value=1.2, step=0.1)
+material_price = st.sidebar.number_input("단가 (원/kg)", value=1200, step=50)
+material_density = st.sidebar.number_input("비중", value=7.85, step=0.01)
+
+if "일반" in mat_type:
+    rec_bridge, rec_margin = max(1.2, 1.2 * material_thickness), max(1.5, 1.5 * material_thickness)
+else:
+    rec_bridge, rec_margin = max(1.5, 1.5 * material_thickness), max(2.0, 1.8 * material_thickness)
+
+st.sidebar.header("📏 2. 배열 간격 (다이 강도 고려)")
+bridge = st.sidebar.number_input("부품간 최소 간격 (mm)", value=float(round(rec_bridge, 1)), step=0.1)
+margin = st.sidebar.number_input("가장자리 마진 (mm)", value=float(round(rec_margin, 1)), step=0.1)
+
+st.sidebar.header("🔧 3. 캐리어 & 파일럿 설계")
+carrier_width = st.sidebar.number_input("캐리어(스켈레톤) 폭 (mm)", value=float(round(max(4.0, 3 * material_thickness), 1)), step=0.5, help="부품을 다음 스테이션으로 이송시키는 스켈레톤 밴드 폭. 스트립 상/하단에 배치됩니다.")
+pilot_dia = st.sidebar.number_input("파일럿 홀 지름 (mm)", value=4.0, step=0.5)
+if not (carrier_width > 0 and 0 < pilot_dia < carrier_width):
+    st.sidebar.caption("⚠️ 파일럿 홀 지름이 캐리어 폭보다 크거나 같아 Layout도에 표시되지 않습니다.")
+
+st.sidebar.header("🛠️ 4. Layout도 설계")
+st_notch = st.sidebar.number_input("노칭 / 파이롯트 홀", value=1, step=1)
+st_pierce = st.sidebar.number_input("피어싱 (내측 홀 타발)", value=1, step=1)
+st_bend = st.sidebar.number_input("벤딩", value=0, step=1)
+st_form = st.sidebar.number_input("포밍", value=0, step=1)
+st_final_notch = st.sidebar.number_input("노칭 (최종 낙하)", value=1, step=1)
+st_idle = st.sidebar.number_input("아이들 피치 (빈 구간)", value=1, step=1)
+st_simul = st.sidebar.number_input("➖ 동시 성형 (중복 차감)", value=0, step=1)
+
+total_stations = max(1, int((st_notch + st_pierce + st_bend + st_form + st_final_notch + st_idle) - st_simul))
+st.sidebar.info(f"**총 예상 스테이션: {total_stations} 피치**")
+
+st.sidebar.header("🧭 5. 압연방향(그레인) 제약")
+apply_rolling_constraint = st.sidebar.checkbox("벤딩 라인 - 압연방향 최소 이격각 적용", value=(st_bend > 0), help="프레스 피드 방향(=압연방향, 도면 X축과 평행)과 벤딩 라인이 너무 나란하면 성형 시 크랙 위험이 커집니다.")
+bend_angles_input = st.sidebar.text_input("벤딩 라인 각도 (°, 쉼표로 다중 입력)", value="0", disabled=not apply_rolling_constraint)
+min_angle_from_rolling = st.sidebar.number_input("최소 이격각 (°, 통상 30~45° 권장)", value=30.0, step=5.0, disabled=not apply_rolling_constraint)
+
+bend_line_angles = []
+if apply_rolling_constraint:
+    try:
+        bend_line_angles = [float(x.strip()) for x in bend_angles_input.split(',')]
+    except ValueError:
+        st.sidebar.error("❌ 벤딩 라인 각도는 숫자와 쉼표(,)로만 입력해주세요. (예: 0, 90)")
+        st.stop()
+
+
+# ============================================================
+# [6] 메인 화면 동작 및 결과 캐싱 로직
+# ============================================================
+st.markdown("#### 📂 1. 도면 업로드")
+st.info("💡 **DXF 업로드 시 주의사항:** 정확한 계산을 위해 제품의 외곽선과 내부 피어싱 홀들은 반드시 각각 하나의 **'닫힌 폴리라인(Closed Polyline)'**으로 연결되어 있어야 합니다.")
+uploaded_file = st.file_uploader("DXF 전개도면을 업로드하세요.", type=['dxf'])
+
+st.markdown("#### 📐 2. 계산 각도 옵션 선택")
+angle_step_option = st.radio("배열 회전 탐색 각도 간격을 선택하세요:", ["10도씩 (기본, 빠른 계산)", "5도씩 (정밀 계산)"], horizontal=True)
+angle_step = 5 if "5도" in angle_step_option else 10
+
+file_hash = hashlib.md5(uploaded_file.getvalue()).hexdigest() if uploaded_file else None
+
+current_params = (
+    file_hash, bridge, margin, carrier_width,
+    material_thickness, material_density, material_price, 
+    apply_rolling_constraint, tuple(bend_line_angles), min_angle_from_rolling, angle_step
+)
+
+if 'last_params' not in st.session_state:
+    st.session_state.last_params = None
+
+recalculated = False
+
+if uploaded_file is not None:
+    if st.session_state.last_params != current_params:
+        recalculated = True 
+        with st.spinner('안전 간격 적용 및 초정밀 형상 파고들기(Staggering)를 분석 중입니다...'):
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp:
+                tmp.write(uploaded_file.getvalue())
+                tmp_path = tmp.name
+
+            doc = ezdxf.readfile(tmp_path)
+            msp = doc.modelspace()
+            os.remove(tmp_path)
+
+            unit_factor, unit_msg = get_unit_factor(doc)
+            part, holes = read_part_with_holes(msp, unit_factor)
+            
+            if part is None:
+                st.error("❌ 도면에서 닫힌 다각형(폴리라인)을 찾을 수 없습니다. CAD에서 JOIN 명령어로 선들을 하나의 닫힌 폴리라인으로 결합해주세요.")
+                st.stop()
+                
+            if part.geom_type == 'MultiPolygon':
+                part = max(part.geoms, key=lambda a: a.area)
+                
+            part_area, pair_area = part.area, part.area * 2
+
+            single_results, inter_results, zigzag_results = [], [], []
+            best_s = best_i = best_z = None
+            fallback_s = fallback_i = fallback_z = None
+
+            for angle in range(0, 180, angle_step):
+                rotated_part = rotate(part, angle, origin='centroid')
+                p_base = calculate_1d_pitch(rotated_part, bridge)
+
+                valid = True
+                if apply_rolling_constraint:
+                    for b_angle in bend_line_angles:
+                        eff_angle = (b_angle + angle) % 180
+                        dist_from_parallel = min(eff_angle, 180 - eff_angle)
+                        if dist_from_parallel < min_angle_from_rolling:
+                            valid = False; break
+
+                # [1] 단일 배열 계산
+                minx, miny, maxx, maxy = rotated_part.bounds
+                w_s = (maxy - miny) + margin * 2 + carrier_width * 2
+                util_s = (part_area / (p_base * w_s)) * 100
+                cost_s = (((p_base * w_s * material_thickness) * material_density) / 1_000_000) * material_price
+                record_s = {'util': util_s, 'cost': cost_s, 'angle': angle, 'parts': [rotated_part], 'w': w_s, 'p': p_base}
+                single_results.append({
+                    '각도': f"{angle}°", '피치(mm)': round(p_base, 2), '소재폭(mm)': round(w_s, 2),
+                    '소재이용율(%)': round(util_s, 2), '1개당 원가(원)': int(cost_s), '압연방향 적합': 'O' if valid else 'X'
+                })
+                if fallback_s is None or util_s > fallback_s['util']: fallback_s = record_s
+                if valid and (best_s is None or util_s > best_s['util']): best_s = record_s
+
+                # [2] 180도 교차 배열 계산
+                part_180 = rotate(rotated_part, 180, origin='centroid')
+                dx_i, dy_i, geom_i, part_b_i = find_nesting_offset(rotated_part, part_180, p_base, bridge)
+                if part_b_i:
+                    w_i = (geom_i.bounds[3] - geom_i.bounds[1]) + margin * 2 + carrier_width * 2
+                    util_i = (pair_area / (p_base * w_i)) * 100
+                    cost_i = (((p_base * w_i * material_thickness) * material_density) / 1_000_000) * material_price / 2
+                    record_i = {'util': util_i, 'cost': cost_i, 'angle': angle, 'parts': [rotated_part, part_b_i], 'w': w_i, 'p': p_base}
+                    inter_results.append({
+                        '각도': f"{angle}°", '피치(mm)': round(p_base, 2), '소재폭(mm)': round(w_i, 2),
+                        '소재이용율(%)': round(util_i, 2), '1개당 원가(원)': int(cost_i), '압연방향 적합': 'O' if valid else 'X'
+                    })
+                    if fallback_i is None or util_i > fallback_i['util']: fallback_i = record_i
+                    if valid and (best_i is None or util_i > best_i['util']): best_i = record_i
+
+                # [3] 지그재그 배열 계산
+                part_same = rotated_part
+                dx_z, dy_z, geom_z, part_b_z = find_nesting_offset(rotated_part, part_same, p_base, bridge)
+                if part_b_z:
+                    w_z = (geom_z.bounds[3] - geom_z.bounds[1]) + margin * 2 + carrier_width * 2
+                    util_z = (pair_area / (p_base * w_z)) * 100
+                    cost_z = (((p_base * w_z * material_thickness) * material_density) / 1_000_000) * material_price / 2
+                    record_z = {'util': util_z, 'cost': cost_z, 'angle': angle, 'parts': [rotated_part, part_b_z], 'w': w_z, 'p': p_base}
+                    zigzag_results.append({
+                        '각도': f"{angle}°", '피치(mm)': round(p_base, 2), '소재폭(mm)': round(w_z, 2),
+                        '소재이용율(%)': round(util_z, 2), '1개당 원가(원)': int(cost_z), '압연방향 적합': 'O' if valid else 'X'
+                    })
+                    if fallback_z is None or util_z > fallback_z['util']: fallback_z = record_z
+                    if valid and (best_z is None or util_z > best_z['util']): best_z = record_z
+
+            s_fallback_used = best_s is None
+            if best_s is None: best_s = fallback_s
+            i_fallback_used = best_i is None
+            if best_i is None: best_i = fallback_i
+            z_fallback_used = best_z is None
+            if best_z is None: best_z = fallback_z
+
+            st.session_state.update({
+                'part_area': part_area, 'pair_area': pair_area, 'holes_count': len(holes),
+                'holes_area': sum(h.area for h in holes) if holes else 0.0,
+                'single': (single_results, best_s, s_fallback_used),
+                'inter': (inter_results, best_i, i_fallback_used),
+                'zigzag': (zigzag_results, best_z, z_fallback_used),
+                'unit_msg': unit_msg
+            })
+            st.session_state.last_params = current_params
+
+    s_res, best_s, s_fall = st.session_state['single']
+    i_res, best_i, i_fall = st.session_state['inter']
+    z_res, best_z, z_fall = st.session_state['zigzag']
+    
+    st.caption(st.session_state['unit_msg'])
+    if st.session_state['holes_count'] > 0:
+        st.info(f"🕳️ 내측 홀 **{st.session_state['holes_count']}개** 인식됨 (홀 면적 합계: {st.session_state['holes_area']:.1f} mm²) → 소재이용율·원가 계산에 순단면적이 반영되었습니다.")
+
+    candidates = [('단일 배열', best_s)]
+    if best_i: candidates.append(('180도 교차 배열', best_i))
+    if best_z: candidates.append(('지그재그 배열', best_z))
+    best_method_name, best_overall = min(candidates, key=lambda kv: kv[1]['cost'])
+    
+    saving_cost = int(best_s['cost'] - best_overall['cost'])
+    st.success(f"🏆 분석 완료! 가장 훌륭한 배열은 **[{best_method_name}]**이며, 단일 배열 대비 1개당 :blue[**{saving_cost:,}원**]을 절감합니다. (캐리어 폭 {carrier_width}mm 포함 기준)")
+
+    st.header("📊 [1단계] 단위 배열 최적화 결과")
+    if apply_rolling_constraint:
+        st.markdown("💡 **안내:** 표 내부의 <span style='background-color:#ffe6e6; padding:2px 6px; border-radius:4px;'>붉은색 행</span>은 압연방향(그레인) 이격각 조건을 불만족하여 **크랙(터짐) 불량 위험이 높은 기각(사용 불가) 배열**을 의미합니다.", unsafe_allow_html=True)
+
+    col1, col2, col3 = st.columns(3)
+    render_case_column(col1, "[1] 단일 배열", s_res, best_s, s_fall, ['#004b87'], margin, carrier_width)
+    
+    if best_i: render_case_column(col2, "[2] 180도 교차 배열", i_res, best_i, i_fall, ['#004b87', '#007934'], margin, carrier_width)
+    else: 
+        with col2:
+            st.subheader("[2] 180도 교차 배열")
+            st.warning("교차 배열 불가 형상")
+    
+    if best_z: render_case_column(col3, "[3] 지그재그 배열", z_res, best_z, z_fall, ['#004b87', '#d55e00'], margin, carrier_width)
+    else: 
+        with col3:
+            st.subheader("[3] 지그재그 배열")
+            st.warning("지그재그 배열 불가 형상")
+
+    st.divider()
+    st.header("🎞️ [2단계] 스트립 Layout도 및 금형 코어 사이즈 도출")
+    st.markdown(f"좌측에서 입력하신 **총 {total_stations} 피치**, **캐리어 폭 {carrier_width}mm**, **파일럿홀 ⌀{pilot_dia}mm** 조건을 반영한 실제 금형 내부 작업 구간 설계 도면입니다.")
+    
+    st.subheader("◼️ [1] 단일 배열 Layout도")
+    render_strip_section("단일 배열", best_s, total_stations, margin, carrier_width, pilot_dia, ['#004b87'])
+    
+    st.divider()
+    st.subheader("◼️ [2] 180도 교차 배열 Layout도")
+    if best_i: 
+        render_strip_section("180도 교차 배열", best_i, total_stations, margin, carrier_width, pilot_dia, ['#004b87', '#007934'])
+    else:
+        st.warning("이 부품은 180도 교차 배열이 불가능합니다.")
+        
+    st.divider()
+    st.subheader("◼️ [3] 다열 지그재그 배열 Layout도")
+    if best_z: 
+        render_strip_section("지그재그 배열", best_z, total_stations, margin, carrier_width, pilot_dia, ['#004b87', '#d55e00'])
+    else:
+        st.warning("이 부품은 지그재그 배열이 불가능합니다.")
+
+
+    # ============================================================
+    # [7] 수동 미세 조정 (Fine-Tuning)
+    # ============================================================
+    st.divider()
+    st.header("🛠️ [3단계] 수동 미세 조정 (Fine-Tuning)")
+    st.markdown("자동으로 계산된 최적 배열을 바탕으로 실무 설계자의 감각에 맞춰 **숫자를 증감(+, -) 시키면 즉시 도면과 원가에 반영**됩니다.")
+
+    if 'last_tune_target' not in st.session_state:
+        st.session_state.last_tune_target = None
+
+    valid_option_names = [k for k, v in candidates]
+
+    if ('tune_target_select' not in st.session_state
+            or st.session_state['tune_target_select'] not in valid_option_names):
+        st.session_state['tune_target_select'] = best_method_name
+
+    tune_target_name = st.selectbox("조정할 배열 방식 선택", options=valid_option_names, key='tune_target_select')
+    target_best = next(v for k, v in candidates if k == tune_target_name)
+    is_pair = tune_target_name != '단일 배열'
+
+    tkey = tune_target_name
+
+    tune_reset_signature = (file_hash, tune_target_name)
+    if st.session_state.last_tune_target != tune_reset_signature or recalculated:
+        st.session_state[f"tune_angle_{tkey}"] = float(target_best['angle'])
+        st.session_state[f"tune_pitch_{tkey}"] = float(target_best['p'])
+        st.session_state[f"tune_width_{tkey}"] = float(target_best['w'])
+        st.session_state[f"tune_y1_{tkey}"] = 0.0
+        st.session_state[f"tune_y2_{tkey}"] = 0.0
+        st.session_state[f"tune_x2_{tkey}"] = 0.0
+        st.session_state.last_tune_target = tune_reset_signature
+
+    fc1, fc2 = st.columns(2)
+    with fc1:
+        st.subheader("⚙️ 파라미터 미세조정")
+        tune_angle = st.number_input("전체 회전 각도 (°, 원본 기준)", step=1.0, key=f"tune_angle_{tkey}")
+        tune_pitch = st.number_input("피치 (Pitch, mm)", step=0.1, min_value=0.1, key=f"tune_pitch_{tkey}")
+        tune_width = st.number_input("소재 폭 (Width, mm)", step=0.5, min_value=0.1, key=f"tune_width_{tkey}")
+
+    with fc2:
+        st.subheader("↕️ 위치 오프셋 (Offset)")
+        tune_y1 = st.number_input("파트 1 Y축 위치 이동 (mm)", step=0.5, key=f"tune_y1_{tkey}")
+        tune_y2 = st.number_input("파트 2 Y축 위치 이동 (mm)", step=0.5, disabled=not is_pair, key=f"tune_y2_{tkey}")
+        tune_x2 = st.number_input("파트 2 X축 위치 이동 (mm)", step=0.5, disabled=not is_pair, key=f"tune_x2_{tkey}")
+
+    # 미세 조정된 형상 재계산
+    if len(target_best['parts']) == 1:
+        center_geom = target_best['parts'][0]
+    else:
+        center_geom = unary_union(target_best['parts'])
+
+    delta_angle = tune_angle - target_best['angle']
+    tuned_parts = []
+    
+    for idx, geom in enumerate(target_best['parts']):
+        g = rotate(geom, delta_angle, origin=center_geom.centroid)
+        if idx == 0:
+            g = translate(g, 0, tune_y1)
+        elif idx == 1:
+            g = translate(g, tune_x2, tune_y2)
+        tuned_parts.append(g)
+
+    all_geom_tuned = tuned_parts[0] if len(tuned_parts) == 1 else unary_union(tuned_parts)
+    minx, miny, maxx, maxy = all_geom_tuned.bounds
+
+    interference_tol = 0.01  
+    is_clashing = False
+    
+    if is_pair:
+        base_min_pitch = calculate_1d_pitch(tuned_parts[0], bridge)
+        if tune_pitch < base_min_pitch - interference_tol:
+            is_clashing = True
+        else:
+            buf_0 = tuned_parts[0].buffer(bridge - interference_tol, resolution=4)
+            buf_1 = tuned_parts[1].buffer(bridge - interference_tol, resolution=4)
+            
+            if buf_0.intersects(tuned_parts[1]): is_clashing = True
+            
+            for step in [-2, -1, 1, 2]:
+                shift_x = step * tune_pitch
+                if buf_0.intersects(translate(tuned_parts[0], xoff=shift_x, yoff=0)): is_clashing = True
+                if buf_1.intersects(translate(tuned_parts[1], xoff=shift_x, yoff=0)): is_clashing = True
+                if buf_0.intersects(translate(tuned_parts[1], xoff=shift_x, yoff=0)): is_clashing = True
+    else:
+        base_min_pitch = calculate_1d_pitch(tuned_parts[0], bridge)
+        if tune_pitch < base_min_pitch - interference_tol:
+            is_clashing = True
+
+    if is_clashing:
+        st.error(f"🚫 **간섭 경고:** 현재 설정된 피치({tune_pitch:.2f}mm) 또는 오프셋 위치에서는 인접한 부품끼리 겹치거나 최소 브릿지 간격({bridge}mm)을 침범합니다. 값을 넉넉하게 조정하세요.")
+        
+    min_required_width = (maxy - miny) + margin * 2 + carrier_width * 2
+    if tune_width < min_required_width - interference_tol:
+        st.error(f"🚫 **폭 부족 경고:** 현재 소재 폭({tune_width:.2f}mm)이 이 형상을 담기 위한 "
+                 f"최소 폭({min_required_width:.2f}mm)보다 작습니다. 부품이 마진/캐리어 영역을 벗어날 수 있습니다.")
+
+    # 원가 재계산
+    tune_util = (st.session_state['pair_area'] if is_pair else st.session_state['part_area']) / (tune_pitch * tune_width) * 100
+    cost_divisor = 2 if is_pair else 1
+    tune_cost = (((tune_pitch * tune_width * material_thickness) * material_density) / 1_000_000) * material_price / cost_divisor
+
+    st.success(f"**미세조정 결과** ➔ 변경된 소재이용율: :blue[**{tune_util:.2f}%**]  |  변경된 1개당 단가: :blue[**{int(tune_cost):,}원**]")
+
+    # 화면 렌더링용 기하학 계산
+    part_length_tuned = maxx - minx
+    total_length_tuned = (tune_pitch * (total_stations - 1)) + part_length_tuned + (tune_pitch * 0.4)
+    x_shift = -minx + (tune_pitch * 0.2)
+
+    extra_width = max(0.0, tune_width - min_required_width)
+    y_shift = -miny + margin + carrier_width + extra_width / 2
+
+    fig_tune, ax_tune = plt.subplots(figsize=(max(8, total_stations * 2), 4))
+    
+    ax_tune.plot([0, total_length_tuned, total_length_tuned, 0, 0], 
+                 [0, 0, tune_width, tune_width, 0], color='red', linestyle='-', linewidth=2.5,
+                 label=f'조정 후 코어 사이즈\n(가로: {total_length_tuned:.1f} x 세로: {tune_width:.1f} | 피치: {tune_pitch:.2f})')
+    
+    if carrier_width > 0:
+        ax_tune.add_patch(Rectangle((0, 0), total_length_tuned, carrier_width, facecolor='#999999', alpha=0.25, edgecolor='none', zorder=1))
+        ax_tune.add_patch(Rectangle((0, tune_width - carrier_width), total_length_tuned, carrier_width, facecolor='#999999', alpha=0.25, edgecolor='none', zorder=1))
+
+    for i in range(total_stations):
+        for idx, geom in enumerate(tuned_parts):
+            color = ['#004b87', '#007934'][idx] if is_pair else '#004b87'
+            if tune_target_name == '지그재그 배열': color = ['#004b87', '#d55e00'][idx]
+            shifted = translate(geom, xoff=x_shift + (i * tune_pitch), yoff=y_shift)
+            plot_polygon(ax_tune, shifted, color, lw=1.5, alpha=0.7)
+
+        if carrier_width > 0 and 0 < pilot_dia < carrier_width:
+            ax_tune.add_patch(Circle((tune_pitch * (i + 0.5), carrier_width / 2), pilot_dia / 2, facecolor='white', edgecolor='black', linewidth=1.2, zorder=5))
+        if i < total_stations - 1:
+            ax_tune.plot([tune_pitch * (i + 1), tune_pitch * (i + 1)], [0, tune_width], color='black', linestyle=':', alpha=0.4, zorder=1)
+
+    ax_tune.axis('equal'); ax_tune.set_xticks([]); ax_tune.set_yticks([])
+    ax_tune.legend(loc='center left', bbox_to_anchor=(1.02, 0.5))
+    st.pyplot(fig_tune)
+
+    # ============================================================
+    # [8] CAD 작업용 DXF Export 
+    # ============================================================
+    st.divider()
+    st.subheader("💾 [4단계] CAD 도면(DXF) 내보내기")
+    st.markdown("위에서 미세조정을 마친 최종 배열을 CAD(AutoCAD 등)에서 바로 작업할 수 있도록 **DXF 파일로 다운로드**합니다. 레이어 분리(외곽선/제품/파일럿홀)가 적용되어 실무 설계에 즉시 활용 가능합니다.")
+    
+    dxf_bytes = generate_dxf_bytes(
+        tuned_parts=tuned_parts,
+        tune_pitch=tune_pitch,
+        tune_width=tune_width,
+        total_stations=total_stations,
+        margin=margin,
+        carrier_width=carrier_width,
+        pilot_dia=pilot_dia,
+        x_shift=x_shift,
+        y_shift=y_shift
+    )
+    
+    st.download_button(
+        label="📥 최종 스트립 레이아웃 DXF 다운로드",
+        data=dxf_bytes,
+        file_name="optimized_strip_layout.dxf",
+        mime="application/dxf",
+        type="primary"
+    )
