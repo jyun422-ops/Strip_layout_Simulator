@@ -145,13 +145,36 @@ def find_nesting_offset(part_a, part_b, p_base, bridge):
 
 
 # ============================================================
-# [2] DXF 읽기 및 시각화(Rendering)
+# [2] DXF 읽기 및 시각화(Rendering) (블록 자동 분해 기능 포함)
 # ============================================================
+def extract_entities_recursive(entity_container):
+    target_types = {'LWPOLYLINE', 'POLYLINE', 'CIRCLE', 'ELLIPSE', 'SPLINE'}
+    extracted = []
+    
+    for entity in entity_container:
+        if entity.dxftype() == 'INSERT':
+            try:
+                for virt_entity in entity.virtual_entities():
+                    if virt_entity.dxftype() == 'INSERT':
+                        extracted.extend(extract_entities_recursive([virt_entity]))
+                    elif virt_entity.dxftype() in target_types:
+                        extracted.append(virt_entity)
+            except Exception:
+                continue
+        elif entity.dxftype() in target_types:
+            extracted.append(entity)
+            
+    return extracted
+
 def read_part_with_holes(msp, unit_factor):
     candidates = []
     flatten_tol = 0.1 if unit_factor == 0 else max(1e-4, 0.05 / unit_factor)
-    for entity in msp.query('LWPOLYLINE POLYLINE CIRCLE ELLIPSE SPLINE'):
+    
+    valid_entities = extract_entities_recursive(msp)
+    
+    for entity in valid_entities:
         try:
+            dxftype = entity.dxftype()
             p = path.make_path(entity)
             coords = [(v.x * unit_factor, v.y * unit_factor) for v in p.flattening(distance=flatten_tol)]
             if len(coords) < 3: continue
@@ -332,9 +355,10 @@ def render_strip_section(label, best, total_stations, margin, carrier_width, pil
     fig = plot_strip_layout(list(zip(best['parts'], colors)), best['p'], part_zone, margin, carrier_width, pilot_dia, total_stations)
     st.pyplot(fig)
 
+# ⭐ 수정됨: 부품을 선(Polyline)이 아닌 블록(BLOCK/INSERT)으로 DXF 내보내기 로직
 def generate_dxf_bytes(tuned_parts, tune_pitch, tune_width, total_stations, margin, carrier_width, pilot_dia, x_shift, y_shift):
     doc = ezdxf.new('R2010')
-    doc.header['$INSUNITS'] = 4
+    doc.header['$INSUNITS'] = 4  # 단위: mm
     msp = doc.modelspace()
     doc.layers.add("STRIP_EDGE", color=1)
     doc.layers.add("PARTS", color=7)
@@ -345,24 +369,48 @@ def generate_dxf_bytes(tuned_parts, tune_pitch, tune_width, total_stations, marg
     part_length_tuned = maxx - minx
     total_length_tuned = (tune_pitch * (total_stations - 1)) + part_length_tuned + (tune_pitch * 0.4)
 
+    # 코어 외곽 가이드라인 (단순 선)
     msp.add_lwpolyline([(0, 0), (total_length_tuned, 0)], dxfattribs={'layer': 'STRIP_EDGE'})
     msp.add_lwpolyline([(0, tune_width), (total_length_tuned, tune_width)], dxfattribs={'layer': 'STRIP_EDGE'})
     
-    def add_poly_to_msp(poly, layer_name):
+    # 도형을 블록 내부에 그려넣는 헬퍼 함수
+    def add_poly_to_block(poly, layer_name, target_block):
         if poly.geom_type == 'MultiPolygon':
-            for p in poly.geoms: add_poly_to_msp(p, layer_name)
+            for p in poly.geoms: add_poly_to_block(p, layer_name, target_block)
             return
-        msp.add_lwpolyline(list(poly.exterior.coords), dxfattribs={'layer': layer_name, 'closed': True})
+        target_block.add_lwpolyline(list(poly.exterior.coords), dxfattribs={'layer': layer_name, 'closed': True})
         for interior in poly.interiors:
-            msp.add_lwpolyline(list(interior.coords), dxfattribs={'layer': layer_name, 'closed': True})
+            target_block.add_lwpolyline(list(interior.coords), dxfattribs={'layer': layer_name, 'closed': True})
 
+    # 1. 튜닝된 개별 부품들을 위한 BLOCK 정의 생성
+    part_centroids = []
+    for idx, geom in enumerate(tuned_parts):
+        block_name = f"PART_BLOCK_{idx + 1}"
+        if block_name not in doc.blocks:
+            block = doc.blocks.new(name=block_name)
+            # 프로의 디테일: 부품의 정중앙(Centroid)을 캐드 블록의 기준점(Base Point, 0,0)으로 맞춘다.
+            cx, cy = geom.centroid.x, geom.centroid.y
+            centered_geom = translate(geom, xoff=-cx, yoff=-cy)
+            add_poly_to_block(centered_geom, "PARTS", block)
+            part_centroids.append((cx, cy))
+
+    # 2. 각 스테이션(피치)마다 블록 참조(INSERT) 배치
     for i in range(total_stations):
-        for geom in tuned_parts:
-            shifted = translate(geom, xoff=x_shift + (i * tune_pitch), yoff=y_shift)
-            add_poly_to_msp(shifted, "PARTS")
+        station_x = x_shift + (i * tune_pitch)
+        station_y = y_shift
+        
+        for idx in range(len(tuned_parts)):
+            block_name = f"PART_BLOCK_{idx + 1}"
+            cx, cy = part_centroids[idx]
+            # 블록 삽입점 = 배열된 좌표 기준점 + 블록 내부에서 빼주었던 부품의 중심점 복구
+            insert_x = station_x + cx
+            insert_y = station_y + cy
+            msp.add_blockref(block_name, insert=(insert_x, insert_y))
+
+        # 파일럿 홀 추가
         if carrier_width > 0 and 0 < pilot_dia < carrier_width:
-            cx, cy = tune_pitch * (i + 0.5), carrier_width / 2
-            msp.add_circle(center=(cx, cy), radius=pilot_dia / 2, dxfattribs={'layer': 'PILOT_HOLES'})
+            cx_p, cy_p = tune_pitch * (i + 0.5), carrier_width / 2
+            msp.add_circle(center=(cx_p, cy_p), radius=pilot_dia / 2, dxfattribs={'layer': 'PILOT_HOLES'})
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp:
         doc.saveas(tmp.name)
@@ -371,7 +419,6 @@ def generate_dxf_bytes(tuned_parts, tune_pitch, tune_width, total_stations, marg
     os.remove(tmp_path)
     return dxf_bytes
 
-# ⭐ 추가: 엑셀 리포트 추출 함수
 def generate_excel_report(best_method_name, tune_pitch, tune_width, tune_util, tune_cost, total_stations, mat_type, material_thickness, material_price, material_density, s_res, i_res, z_res):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -401,11 +448,9 @@ def generate_excel_report(best_method_name, tune_pitch, tune_width, tune_util, t
             
     return output.getvalue()
 
-# ⭐ 추가: PDF 리포트 추출 함수
 def generate_pdf_report(fig_layout, best_method_name, tune_pitch, tune_width, tune_util, tune_cost, total_stations, mat_type, material_thickness):
     pdf_buf = io.BytesIO()
     with PdfPages(pdf_buf) as pdf:
-        # 1페이지: 요약 텍스트
         fig_text, ax_text = plt.subplots(figsize=(8, 5))
         ax_text.axis('off')
         
@@ -431,8 +476,6 @@ def generate_pdf_report(fig_layout, best_method_name, tune_pitch, tune_width, tu
         
         pdf.savefig(fig_text)
         plt.close(fig_text)
-        
-        # 2페이지: 레이아웃 도면 (현재 미세조정 화면에 표시된 이미지 그대로)
         pdf.savefig(fig_layout)
         
     return pdf_buf.getvalue()
@@ -495,7 +538,7 @@ if apply_rolling_constraint:
 # [6] 메인 화면 동작 및 결과 캐싱 로직
 # ============================================================
 st.markdown("#### 📂 1. 도면 업로드")
-st.info("💡 **DXF 업로드 시 주의사항:** 정확한 계산을 위해 제품의 외곽선과 내부 피어싱 홀들은 반드시 각각 하나의 **'닫힌 폴리라인(Closed Polyline)'**으로 연결되어 있어야 합니다.")
+st.info("💡 **DXF 업로드 시 주의사항:** 도면의 부품 외곽선과 피어싱 홀은 **닫힌 폴리라인**이나 **블록(BLOCK)** 형태로 묶여 있어야 정확히 인식됩니다.")
 uploaded_file = st.file_uploader("DXF 전개도면을 업로드하세요.", type=['dxf'])
 
 st.markdown("#### 📐 2. 계산 각도 옵션 선택")
@@ -531,7 +574,7 @@ if uploaded_file is not None:
             part, holes = read_part_with_holes(msp, unit_factor)
             
             if part is None:
-                st.error("❌ 도면에서 닫힌 다각형(폴리라인)을 찾을 수 없습니다. CAD에서 JOIN 명령어로 선들을 하나의 닫힌 폴리라인으로 결합해주세요.")
+                st.error("❌ 도면에서 다각형 기하학 정보를 찾을 수 없습니다. CAD 도면을 확인해주세요.")
                 st.stop()
                 
             if part.geom_type == 'MultiPolygon':
@@ -816,7 +859,6 @@ if uploaded_file is not None:
     st.header("💾 [4단계] 데이터 추출 및 내보내기")
     st.markdown("최종 미세조정(Fine-Tuning)이 완료된 결과를 바탕으로 **CAD 도면(DXF)**, **견적용 데이터(Excel)**, 그리고 **보고용 문서(PDF)**를 다운로드할 수 있습니다.")
     
-    # 각 파일 생성
     dxf_bytes = generate_dxf_bytes(
         tuned_parts=tuned_parts, tune_pitch=tune_pitch, tune_width=tune_width,
         total_stations=total_stations, margin=margin, carrier_width=carrier_width,
