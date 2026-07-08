@@ -683,7 +683,7 @@ if uploaded_file is not None:
         if i < total_stations - 1:
             ax_tune.plot([tune_pitch * (i + 1), tune_pitch * (i + 1)], [0, tune_width], color='black', linestyle=':', alpha=0.4, zorder=1)
 
-    ax_tune.axis('equal'); ax_tune.set_xticks([]); ax_tune.set_yticks()
+    ax_tune.axis('equal'); ax_tune.set_xticks([]); ax_tune.set_yticks([]) # <--- [디버깅 완료: set_yticks([]) 빈 리스트 추가]
     st.pyplot(fig_tune)
 
     # ============================================================
