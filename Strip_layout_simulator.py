@@ -16,7 +16,7 @@ import os
 import glob
 import hashlib
 import io
-import math  # 추가: 원형도 계산을 위한 수학 모듈
+import math
 from matplotlib.backends.backend_pdf import PdfPages
 
 
@@ -144,6 +144,13 @@ def find_nesting_offset(part_a, part_b, p_base, bridge):
         return best_dx, best_dy, unary_union([part_a, best_part_b]), best_part_b
     return None, None, None, None
 
+def check_multi_row_clash(parts, bridge):
+    """3열 이상 배열 시 간섭이 발생하는지 기하학적으로 검증합니다."""
+    if len(parts) < 3: return False
+    buf0 = parts[0].buffer(bridge - 0.05, resolution=4)
+    for r in range(2, len(parts)):
+        if buf0.intersects(parts[r]): return True
+    return False
 
 # ============================================================
 # [2] DXF 읽기 및 시각화(Rendering) (블록 자동 분해 기능 포함)
@@ -193,7 +200,7 @@ def read_part_with_holes(msp, unit_factor):
 
     if not candidates: return None, []
 
-    # ⭐ 수정됨: 참조용 원(Circle)이 메인 부품으로 오인되는 것을 막기 위한 원형도(Circularity) 필터링
+    # 원형도(Circularity) 필터링 - 참조 원(치수, 피치원) 오인 방지
     valid_outer_candidates = []
     pure_circles = []
 
@@ -202,15 +209,13 @@ def read_part_with_holes(msp, unit_factor):
         perimeter = poly.length
         circularity = (4 * math.pi * area) / (perimeter ** 2) if perimeter > 0 else 0
 
-        if circularity > 0.95:  # 95% 이상 완벽한 원 (피치원, 참조 치수선 등)
+        if circularity > 0.95:  
             pure_circles.append(poly)
         else:
             valid_outer_candidates.append(poly)
 
-    # 1순위: 다각형 형태 중 가장 큰 것을 부품 외곽선으로 지정
     if valid_outer_candidates:
         outer = max(valid_outer_candidates, key=lambda a: a.area)
-    # 2순위: 부품 자체가 둥근 와셔 형태일 경우 예외 처리
     else:
         outer = max(pure_circles, key=lambda a: a.area)
 
@@ -248,47 +253,9 @@ def plot_polygon(ax, poly, color, lw=1.5, alpha=0.5):
         
     ax.plot(*poly.exterior.xy, color=color, linewidth=lw, zorder=4)
 
-
 # ============================================================
-# [3] 배열 각도 스캔 공통 로직
+# [3] UI 렌더링 헬퍼 함수
 # ============================================================
-def analyze_case(base_parts, origin, area_for_util, cost_divisor, bridge, margin, carrier_width,
-                  material_thickness, material_density, material_price, check_rolling, bend_line_angles, min_angle_from_rolling, angle_step):
-    results, best, fallback_best = [], None, None
-
-    for angle in range(0, 180, angle_step):
-        rotated = [rotate(g, angle, origin=origin) for g in base_parts]
-        unioned = rotated[0] if len(rotated) == 1 else unary_union(rotated)
-
-        p_val = calculate_1d_pitch(unioned, bridge)
-        minx, miny, maxx, maxy = unioned.bounds
-        w_val = (maxy - miny) + margin * 2 + carrier_width * 2
-        util = (area_for_util / (p_val * w_val)) * 100
-        cost = (((p_val * w_val * material_thickness) * material_density) / 1_000_000) * material_price / cost_divisor
-
-        valid = True
-        if check_rolling:
-            for b_angle in bend_line_angles:
-                eff_angle = (b_angle + angle) % 180
-                dist_from_parallel = min(eff_angle, 180 - eff_angle)
-                if dist_from_parallel < min_angle_from_rolling:
-                    valid = False
-                    break 
-
-        results.append({
-            '각도': f"{angle}°", '피치(mm)': round(p_val, 2), '소재폭(mm)': round(w_val, 2),
-            '소재이용율(%)': round(util, 2), '1개당 원가(원)': int(cost), '압연방향 적합': 'O' if valid else 'X',
-        })
-
-        record = {'util': util, 'cost': cost, 'angle': angle, 'parts': rotated, 'w': w_val, 'p': p_val}
-        if fallback_best is None or util > fallback_best['util']: fallback_best = record
-        if valid and (best is None or util > best['util']): best = record
-
-    used_fallback = best is None
-    if best is None: best = fallback_best
-    return results, best, used_fallback
-
-
 def render_case_column(col, label, results, best, used_fallback, colors, margin, carrier_width):
     with col:
         st.subheader(f"{label} ({best['angle']}°)")
@@ -299,7 +266,8 @@ def render_case_column(col, label, results, best, used_fallback, colors, margin,
         fig, ax = plt.subplots(figsize=(6, 6))
         for geom, color in zip(best['parts'], colors):
             plot_polygon(ax, geom, color)
-        all_geom = best['parts'][0] if len(best['parts']) == 1 else unary_union(best['parts'])
+        
+        all_geom = unary_union(best['parts'])
         sx1, sy1 = all_geom.bounds[0], all_geom.bounds[1] - margin - carrier_width
         sy2 = all_geom.bounds[3] + margin + carrier_width
         
@@ -366,7 +334,7 @@ def plot_strip_layout(parts_and_colors, pitch, part_zone_width, margin, carrier_
     return fig
 
 def render_strip_section(label, best, total_stations, margin, carrier_width, pilot_dia, colors):
-    all_geoms = best['parts'][0] if len(best['parts']) == 1 else unary_union(best['parts'])
+    all_geoms = unary_union(best['parts'])
     minx, miny, maxx, maxy = all_geoms.bounds
     part_length = maxx - minx
     l_val = (best['p'] * (total_stations - 1)) + part_length + (best['p'] * 0.4)
@@ -378,22 +346,20 @@ def render_strip_section(label, best, total_stations, margin, carrier_width, pil
 
 def generate_dxf_bytes(tuned_parts, tune_pitch, tune_width, total_stations, margin, carrier_width, pilot_dia, x_shift, y_shift):
     doc = ezdxf.new('R2010')
-    doc.header['$INSUNITS'] = 4  # 단위: mm
+    doc.header['$INSUNITS'] = 4  
     msp = doc.modelspace()
     doc.layers.add("STRIP_EDGE", color=1)
     doc.layers.add("PARTS", color=7)
     doc.layers.add("PILOT_HOLES", color=5)
 
-    all_geom_tuned = tuned_parts[0] if len(tuned_parts) == 1 else unary_union(tuned_parts)
+    all_geom_tuned = unary_union(tuned_parts)
     minx, miny, maxx, maxy = all_geom_tuned.bounds
     part_length_tuned = maxx - minx
     total_length_tuned = (tune_pitch * (total_stations - 1)) + part_length_tuned + (tune_pitch * 0.4)
 
-    # 코어 외곽 가이드라인 (단순 선)
     msp.add_lwpolyline([(0, 0), (total_length_tuned, 0)], dxfattribs={'layer': 'STRIP_EDGE'})
     msp.add_lwpolyline([(0, tune_width), (total_length_tuned, tune_width)], dxfattribs={'layer': 'STRIP_EDGE'})
     
-    # 도형을 블록 내부에 그려넣는 헬퍼 함수
     def add_poly_to_block(poly, layer_name, target_block):
         if poly.geom_type == 'MultiPolygon':
             for p in poly.geoms: add_poly_to_block(p, layer_name, target_block)
@@ -402,19 +368,16 @@ def generate_dxf_bytes(tuned_parts, tune_pitch, tune_width, total_stations, marg
         for interior in poly.interiors:
             target_block.add_lwpolyline(list(interior.coords), dxfattribs={'layer': layer_name, 'closed': True})
 
-    # 1. 튜닝된 개별 부품들을 위한 BLOCK 정의 생성
     part_centroids = []
     for idx, geom in enumerate(tuned_parts):
         block_name = f"PART_BLOCK_{idx + 1}"
         if block_name not in doc.blocks:
             block = doc.blocks.new(name=block_name)
-            # 프로의 디테일: 부품의 정중앙(Centroid)을 캐드 블록의 기준점(Base Point, 0,0)으로 맞춘다.
             cx, cy = geom.centroid.x, geom.centroid.y
             centered_geom = translate(geom, xoff=-cx, yoff=-cy)
             add_poly_to_block(centered_geom, "PARTS", block)
             part_centroids.append((cx, cy))
 
-    # 2. 각 스테이션(피치)마다 블록 참조(INSERT) 배치
     for i in range(total_stations):
         station_x = x_shift + (i * tune_pitch)
         station_y = y_shift
@@ -422,12 +385,8 @@ def generate_dxf_bytes(tuned_parts, tune_pitch, tune_width, total_stations, marg
         for idx in range(len(tuned_parts)):
             block_name = f"PART_BLOCK_{idx + 1}"
             cx, cy = part_centroids[idx]
-            # 블록 삽입점 = 배열된 좌표 기준점 + 블록 내부에서 빼주었던 부품의 중심점 복구
-            insert_x = station_x + cx
-            insert_y = station_y + cy
-            msp.add_blockref(block_name, insert=(insert_x, insert_y))
+            msp.add_blockref(block_name, insert=(station_x + cx, station_y + cy))
 
-        # ⭐ 수정됨: Pilot 홀 추가
         if carrier_width > 0 and 0 < pilot_dia < carrier_width:
             cx_p, cy_p = tune_pitch * (i + 0.5), carrier_width / 2
             msp.add_circle(center=(cx_p, cy_p), radius=pilot_dia / 2, dxfattribs={'layer': 'PILOT_HOLES'})
@@ -522,15 +481,14 @@ st.sidebar.header("📏 2. 배열 간격 (다이 강도 고려)")
 bridge = st.sidebar.number_input("부품간 최소 간격 (mm)", value=float(round(rec_bridge, 1)), step=0.1)
 margin = st.sidebar.number_input("가장자리 마진 (mm)", value=float(round(rec_margin, 1)), step=0.1)
 
-# ⭐ 수정됨: 용어 통일 (Pilot 홀)
-st.sidebar.header("🔧 3. 캐리어 & Pilot 설계")
+st.sidebar.header("🔧 3. 캐리어 & 파일럿 설계")
 carrier_width = st.sidebar.number_input("캐리어(스켈레톤) 폭 (mm)", value=float(round(max(4.0, 3 * material_thickness), 1)), step=0.5, help="부품을 다음 스테이션으로 이송시키는 스켈레톤 밴드 폭. 스트립 상/하단에 배치됩니다.")
-pilot_dia = st.sidebar.number_input("Pilot 홀 지름 (mm)", value=4.0, step=0.5)
+pilot_dia = st.sidebar.number_input("파일럿 홀 지름 (mm)", value=4.0, step=0.5)
 if not (carrier_width > 0 and 0 < pilot_dia < carrier_width):
-    st.sidebar.caption("⚠️ Pilot 홀 지름이 캐리어 폭보다 크거나 같아 Layout도에 표시되지 않습니다.")
+    st.sidebar.caption("⚠️ 파일럿 홀 지름이 캐리어 폭보다 크거나 같아 Layout도에 표시되지 않습니다.")
 
 st.sidebar.header("🛠️ 4. Layout도 설계")
-st_notch = st.sidebar.number_input("노칭 / Pilot 홀", value=1, step=1)
+st_notch = st.sidebar.number_input("노칭 / 파일럿 홀", value=1, step=1)
 st_pierce = st.sidebar.number_input("피어싱 (내측 홀 타발)", value=1, step=1)
 st_bend = st.sidebar.number_input("벤딩", value=0, step=1)
 st_form = st.sidebar.number_input("포밍", value=0, step=1)
@@ -554,6 +512,9 @@ if apply_rolling_constraint:
         st.sidebar.error("❌ 벤딩 라인 각도는 숫자와 쉼표(,)로만 입력해주세요. (예: 0, 90)")
         st.stop()
 
+# ⭐ 추가: 3열 이상 다열 배열 설정 기능
+st.sidebar.header("⚙️ 6. 다열 배열 설정")
+num_rows = st.sidebar.number_input("교차/지그재그 배열 열(Row) 수", min_value=2, max_value=10, value=2, step=1, help="2열 이상의 다열 배열 시뮬레이션에 적용됩니다. 단일 배열은 항상 1열 기준으로 고정 계산됩니다.")
 
 # ============================================================
 # [6] 메인 화면 동작 및 결과 캐싱 로직
@@ -571,7 +532,7 @@ file_hash = hashlib.md5(uploaded_file.getvalue()).hexdigest() if uploaded_file e
 current_params = (
     file_hash, bridge, margin, carrier_width,
     material_thickness, material_density, material_price, 
-    apply_rolling_constraint, tuple(bend_line_angles), min_angle_from_rolling, angle_step
+    apply_rolling_constraint, tuple(bend_line_angles), min_angle_from_rolling, angle_step, num_rows
 )
 
 if 'last_params' not in st.session_state:
@@ -582,7 +543,7 @@ recalculated = False
 if uploaded_file is not None:
     if st.session_state.last_params != current_params:
         recalculated = True 
-        with st.spinner('안전 간격 적용 및 초정밀 형상 파고들기(Staggering)를 분석 중입니다...'):
+        with st.spinner('안전 간격 적용 및 다열(Multi-row) 파고들기를 분석 중입니다...'):
             with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp:
                 tmp.write(uploaded_file.getvalue())
                 tmp_path = tmp.name
@@ -619,7 +580,7 @@ if uploaded_file is not None:
                         if dist_from_parallel < min_angle_from_rolling:
                             valid = False; break
 
-                # [1] 단일 배열 계산
+                # [1] 단일 배열 계산 (항상 1열 기준)
                 minx, miny, maxx, maxy = rotated_part.bounds
                 w_s = (maxy - miny) + margin * 2 + carrier_width * 2
                 util_s = (part_area / (p_base * w_s)) * 100
@@ -632,35 +593,56 @@ if uploaded_file is not None:
                 if fallback_s is None or util_s > fallback_s['util']: fallback_s = record_s
                 if valid and (best_s is None or util_s > best_s['util']): best_s = record_s
 
-                # [2] 180도 교차 배열 계산
+                # [2] 교차 배열 계산 (다열 확장 적용)
                 part_180 = rotate(rotated_part, 180, origin='centroid')
-                dx_i, dy_i, geom_i, part_b_i = find_nesting_offset(rotated_part, part_180, p_base, bridge)
-                if part_b_i:
-                    w_i = (geom_i.bounds[3] - geom_i.bounds[1]) + margin * 2 + carrier_width * 2
-                    util_i = (pair_area / (p_base * w_i)) * 100
-                    cost_i = (((p_base * w_i * material_thickness) * material_density) / 1_000_000) * material_price / 2
-                    record_i = {'util': util_i, 'cost': cost_i, 'angle': angle, 'parts': [rotated_part, part_b_i], 'w': w_i, 'p': p_base}
-                    inter_results.append({
-                        '각도': f"{angle}°", '피치(mm)': round(p_base, 2), '소재폭(mm)': round(w_i, 2),
-                        '소재이용율(%)': round(util_i, 2), '1개당 원가(원)': int(cost_i), '압연방향 적합': 'O' if valid else 'X'
-                    })
-                    if fallback_i is None or util_i > fallback_i['util']: fallback_i = record_i
-                    if valid and (best_i is None or util_i > best_i['util']): best_i = record_i
+                dx_i1, dy_i1, _, _ = find_nesting_offset(rotated_part, part_180, p_base, bridge)
+                if dx_i1 is not None:
+                    dx_i2, dy_i2, _, _ = find_nesting_offset(part_180, rotated_part, p_base, bridge)
+                    if dx_i2 is not None:
+                        i_parts = [rotated_part]
+                        cx, cy = 0.0, 0.0
+                        for r in range(1, num_rows):
+                            if r % 2 == 1:
+                                cx += dx_i1; cy += dy_i1
+                                i_parts.append(translate(part_180, xoff=cx, yoff=cy))
+                            else:
+                                cx += dx_i2; cy += dy_i2
+                                i_parts.append(translate(rotated_part, xoff=cx, yoff=cy))
+                        
+                        if not check_multi_row_clash(i_parts, bridge):
+                            geom_i = unary_union(i_parts)
+                            w_i = (geom_i.bounds[3] - geom_i.bounds[1]) + margin * 2 + carrier_width * 2
+                            util_i = (part_area * num_rows / (p_base * w_i)) * 100
+                            cost_i = (((p_base * w_i * material_thickness) * material_density) / 1_000_000) * material_price / num_rows
+                            record_i = {'util': util_i, 'cost': cost_i, 'angle': angle, 'parts': i_parts, 'w': w_i, 'p': p_base}
+                            inter_results.append({
+                                '각도': f"{angle}°", '피치(mm)': round(p_base, 2), '소재폭(mm)': round(w_i, 2),
+                                '소재이용율(%)': round(util_i, 2), '1개당 원가(원)': int(cost_i), '압연방향 적합': 'O' if valid else 'X'
+                            })
+                            if fallback_i is None or util_i > fallback_i['util']: fallback_i = record_i
+                            if valid and (best_i is None or util_i > best_i['util']): best_i = record_i
 
-                # [3] 지그재그 배열 계산
-                part_same = rotated_part
-                dx_z, dy_z, geom_z, part_b_z = find_nesting_offset(rotated_part, part_same, p_base, bridge)
-                if part_b_z:
-                    w_z = (geom_z.bounds[3] - geom_z.bounds[1]) + margin * 2 + carrier_width * 2
-                    util_z = (pair_area / (p_base * w_z)) * 100
-                    cost_z = (((p_base * w_z * material_thickness) * material_density) / 1_000_000) * material_price / 2
-                    record_z = {'util': util_z, 'cost': cost_z, 'angle': angle, 'parts': [rotated_part, part_b_z], 'w': w_z, 'p': p_base}
-                    zigzag_results.append({
-                        '각도': f"{angle}°", '피치(mm)': round(p_base, 2), '소재폭(mm)': round(w_z, 2),
-                        '소재이용율(%)': round(util_z, 2), '1개당 원가(원)': int(cost_z), '압연방향 적합': 'O' if valid else 'X'
-                    })
-                    if fallback_z is None or util_z > fallback_z['util']: fallback_z = record_z
-                    if valid and (best_z is None or util_z > best_z['util']): best_z = record_z
+                # [3] 지그재그 배열 계산 (다열 확장 적용)
+                dx_z, dy_z, _, _ = find_nesting_offset(rotated_part, rotated_part, p_base, bridge)
+                if dx_z is not None:
+                    z_parts = [rotated_part]
+                    cx, cy = 0.0, 0.0
+                    for r in range(1, num_rows):
+                        cx += dx_z; cy += dy_z
+                        z_parts.append(translate(rotated_part, xoff=cx, yoff=cy))
+                        
+                    if not check_multi_row_clash(z_parts, bridge):
+                        geom_z = unary_union(z_parts)
+                        w_z = (geom_z.bounds[3] - geom_z.bounds[1]) + margin * 2 + carrier_width * 2
+                        util_z = (part_area * num_rows / (p_base * w_z)) * 100
+                        cost_z = (((p_base * w_z * material_thickness) * material_density) / 1_000_000) * material_price / num_rows
+                        record_z = {'util': util_z, 'cost': cost_z, 'angle': angle, 'parts': z_parts, 'w': w_z, 'p': p_base}
+                        zigzag_results.append({
+                            '각도': f"{angle}°", '피치(mm)': round(p_base, 2), '소재폭(mm)': round(w_z, 2),
+                            '소재이용율(%)': round(util_z, 2), '1개당 원가(원)': int(cost_z), '압연방향 적합': 'O' if valid else 'X'
+                        })
+                        if fallback_z is None or util_z > fallback_z['util']: fallback_z = record_z
+                        if valid and (best_z is None or util_z > best_z['util']): best_z = record_z
 
             s_fallback_used = best_s is None
             if best_s is None: best_s = fallback_s
@@ -670,7 +652,7 @@ if uploaded_file is not None:
             if best_z is None: best_z = fallback_z
 
             st.session_state.update({
-                'part_area': part_area, 'pair_area': pair_area, 'holes_count': len(holes),
+                'part_area': part_area, 'holes_count': len(holes),
                 'holes_area': sum(h.area for h in holes) if holes else 0.0,
                 'single': (single_results, best_s, s_fallback_used),
                 'inter': (inter_results, best_i, i_fallback_used),
@@ -688,8 +670,8 @@ if uploaded_file is not None:
         st.info(f"🕳️ 내측 홀 **{st.session_state['holes_count']}개** 인식됨 (홀 면적 합계: {st.session_state['holes_area']:.1f} mm²) → 소재이용율·원가 계산에 순단면적이 반영되었습니다.")
 
     candidates = [('단일 배열', best_s)]
-    if best_i: candidates.append(('180도 교차 배열', best_i))
-    if best_z: candidates.append(('지그재그 배열', best_z))
+    if best_i: candidates.append((f'{num_rows}열 교차 배열', best_i))
+    if best_z: candidates.append((f'{num_rows}열 지그재그 배열', best_z))
     best_method_name, best_overall = min(candidates, key=lambda kv: kv[1]['cost'])
     
     saving_cost = int(best_s['cost'] - best_overall['cost'])
@@ -700,45 +682,49 @@ if uploaded_file is not None:
         st.markdown("💡 **안내:** 표 내부의 <span style='background-color:#ffe6e6; padding:2px 6px; border-radius:4px;'>붉은색 행</span>은 압연방향(그레인) 이격각 조건을 불만족하여 **크랙(터짐) 불량 위험이 높은 기각(사용 불가) 배열**을 의미합니다.", unsafe_allow_html=True)
 
     col1, col2, col3 = st.columns(3)
+    
+    # 렌더링에 사용될 다열용 색상 팔레트
+    color_palette_i = ['#004b87', '#007934'] * 5 
+    color_palette_z = ['#004b87', '#d55e00'] * 5 
+
     render_case_column(col1, "[1] 단일 배열", s_res, best_s, s_fall, ['#004b87'], margin, carrier_width)
     
-    if best_i: render_case_column(col2, "[2] 180도 교차 배열", i_res, best_i, i_fall, ['#004b87', '#007934'], margin, carrier_width)
+    if best_i: render_case_column(col2, f"[2] {num_rows}열 교차 배열", i_res, best_i, i_fall, color_palette_i[:num_rows], margin, carrier_width)
     else: 
         with col2:
-            st.subheader("[2] 180도 교차 배열")
-            st.warning("교차 배열 불가 형상")
+            st.subheader(f"[2] {num_rows}열 교차 배열")
+            st.warning("교차 다열 배열 불가 형상")
     
-    if best_z: render_case_column(col3, "[3] 지그재그 배열", z_res, best_z, z_fall, ['#004b87', '#d55e00'], margin, carrier_width)
+    if best_z: render_case_column(col3, f"[3] {num_rows}열 지그재그 배열", z_res, best_z, z_fall, color_palette_z[:num_rows], margin, carrier_width)
     else: 
         with col3:
-            st.subheader("[3] 지그재그 배열")
-            st.warning("지그재그 배열 불가 형상")
+            st.subheader(f"[3] {num_rows}열 지그재그 배열")
+            st.warning("지그재그 다열 배열 불가 형상")
 
     st.divider()
     st.header("🎞️ [2단계] 스트립 Layout도 및 금형 코어 사이즈 도출")
-    # ⭐ 수정됨: 용어 통일 (Pilot 홀)
-    st.markdown(f"좌측에서 입력하신 **총 {total_stations} 피치**, **캐리어 폭 {carrier_width}mm**, **Pilot 홀 ⌀{pilot_dia}mm** 조건을 반영한 실제 금형 내부 작업 구간 설계 도면입니다.")
+    st.markdown(f"좌측에서 입력하신 **총 {total_stations} 피치**, **캐리어 폭 {carrier_width}mm**, **파일럿 홀 ⌀{pilot_dia}mm** 조건을 반영한 실제 금형 내부 작업 구간 설계 도면입니다.")
     
     st.subheader("◼️ [1] 단일 배열 Layout도")
     render_strip_section("단일 배열", best_s, total_stations, margin, carrier_width, pilot_dia, ['#004b87'])
     
     st.divider()
-    st.subheader("◼️ [2] 180도 교차 배열 Layout도")
+    st.subheader(f"◼️ [2] {num_rows}열 교차 배열 Layout도")
     if best_i: 
-        render_strip_section("180도 교차 배열", best_i, total_stations, margin, carrier_width, pilot_dia, ['#004b87', '#007934'])
+        render_strip_section(f"{num_rows}열 교차 배열", best_i, total_stations, margin, carrier_width, pilot_dia, color_palette_i[:num_rows])
     else:
-        st.warning("이 부품은 180도 교차 배열이 불가능합니다.")
+        st.warning(f"이 부품은 {num_rows}열 교차 배열이 불가능합니다.")
         
     st.divider()
-    st.subheader("◼️ [3] 다열 지그재그 배열 Layout도")
+    st.subheader(f"◼️ [3] {num_rows}열 지그재그 배열 Layout도")
     if best_z: 
-        render_strip_section("지그재그 배열", best_z, total_stations, margin, carrier_width, pilot_dia, ['#004b87', '#d55e00'])
+        render_strip_section(f"{num_rows}열 지그재그 배열", best_z, total_stations, margin, carrier_width, pilot_dia, color_palette_z[:num_rows])
     else:
-        st.warning("이 부품은 지그재그 배열이 불가능합니다.")
+        st.warning(f"이 부품은 {num_rows}열 지그재그 배열이 불가능합니다.")
 
 
     # ============================================================
-    # [7] 수동 미세 조정 (Fine-Tuning)
+    # [7] 수동 미세 조정 (Fine-Tuning) - 다열 맞춤형 개편
     # ============================================================
     st.divider()
     st.header("🛠️ [3단계] 수동 미세 조정 (Fine-Tuning)")
@@ -755,7 +741,7 @@ if uploaded_file is not None:
 
     tune_target_name = st.selectbox("조정할 배열 방식 선택", options=valid_option_names, key='tune_target_select')
     target_best = next(v for k, v in candidates if k == tune_target_name)
-    is_pair = tune_target_name != '단일 배열'
+    is_multi = len(target_best['parts']) > 1
 
     tkey = tune_target_name
 
@@ -764,9 +750,9 @@ if uploaded_file is not None:
         st.session_state[f"tune_angle_{tkey}"] = float(target_best['angle'])
         st.session_state[f"tune_pitch_{tkey}"] = float(target_best['p'])
         st.session_state[f"tune_width_{tkey}"] = float(target_best['w'])
-        st.session_state[f"tune_y1_{tkey}"] = 0.0
-        st.session_state[f"tune_y2_{tkey}"] = 0.0
-        st.session_state[f"tune_x2_{tkey}"] = 0.0
+        st.session_state[f"tune_y_all_{tkey}"] = 0.0
+        st.session_state[f"tune_x_step_{tkey}"] = 0.0
+        st.session_state[f"tune_y_step_{tkey}"] = 0.0
         st.session_state.last_tune_target = tune_reset_signature
 
     fc1, fc2 = st.columns(2)
@@ -778,52 +764,47 @@ if uploaded_file is not None:
 
     with fc2:
         st.subheader("↕️ 위치 오프셋 (Offset)")
-        tune_y1 = st.number_input("파트 1 Y축 위치 이동 (mm)", step=0.5, key=f"tune_y1_{tkey}")
-        tune_y2 = st.number_input("파트 2 Y축 위치 이동 (mm)", step=0.5, disabled=not is_pair, key=f"tune_y2_{tkey}")
-        tune_x2 = st.number_input("파트 2 X축 위치 이동 (mm)", step=0.5, disabled=not is_pair, key=f"tune_x2_{tkey}")
+        tune_y_all = st.number_input("전체 Y축 위치 이동 (mm)", step=0.5, key=f"tune_y_all_{tkey}")
+        tune_x_step = st.number_input("행간 X축 간격 추가 조절 (mm)", step=0.5, disabled=not is_multi, key=f"tune_x_step_{tkey}")
+        tune_y_step = st.number_input("행간 Y축 간격 추가 조절 (mm)", step=0.5, disabled=not is_multi, key=f"tune_y_step_{tkey}")
 
-    # 미세 조정된 형상 재계산
-    if len(target_best['parts']) == 1:
-        center_geom = target_best['parts'][0]
-    else:
-        center_geom = unary_union(target_best['parts'])
-
+    # 다열 배열에 대응하는 미세 조정 형상 재계산
+    center_geom = target_best['parts'][0] if len(target_best['parts']) == 1 else unary_union(target_best['parts'])
     delta_angle = tune_angle - target_best['angle']
     tuned_parts = []
     
     for idx, geom in enumerate(target_best['parts']):
         g = rotate(geom, delta_angle, origin=center_geom.centroid)
-        if idx == 0:
-            g = translate(g, 0, tune_y1)
-        elif idx == 1:
-            g = translate(g, tune_x2, tune_y2)
+        g = translate(g, 0, tune_y_all)  # 1. 전체 그룹 Y축 이동
+        g = translate(g, idx * tune_x_step, idx * tune_y_step) # 2. 행(Row)간 추가 간격(벌리기/좁히기)
         tuned_parts.append(g)
 
-    all_geom_tuned = tuned_parts[0] if len(tuned_parts) == 1 else unary_union(tuned_parts)
+    all_geom_tuned = unary_union(tuned_parts)
     minx, miny, maxx, maxy = all_geom_tuned.bounds
 
     interference_tol = 0.01  
     is_clashing = False
     
-    if is_pair:
-        base_min_pitch = calculate_1d_pitch(tuned_parts[0], bridge)
-        if tune_pitch < base_min_pitch - interference_tol:
-            is_clashing = True
-        else:
-            buf_0 = tuned_parts[0].buffer(bridge - interference_tol, resolution=4)
-            buf_1 = tuned_parts[1].buffer(bridge - interference_tol, resolution=4)
-            
-            if buf_0.intersects(tuned_parts[1]): is_clashing = True
-            
-            for step in [-2, -1, 1, 2]:
-                shift_x = step * tune_pitch
-                if buf_0.intersects(translate(tuned_parts[0], xoff=shift_x, yoff=0)): is_clashing = True
-                if buf_1.intersects(translate(tuned_parts[1], xoff=shift_x, yoff=0)): is_clashing = True
-                if buf_0.intersects(translate(tuned_parts[1], xoff=shift_x, yoff=0)): is_clashing = True
+    base_min_pitch = calculate_1d_pitch(tuned_parts[0], bridge)
+    if tune_pitch < base_min_pitch - interference_tol:
+        is_clashing = True
     else:
-        base_min_pitch = calculate_1d_pitch(tuned_parts[0], bridge)
-        if tune_pitch < base_min_pitch - interference_tol:
-            is_clashing = True
+        # 다열 배열 간섭 검증
+        for r in range(1, len(tuned_parts)):
+            buf_prev = tuned_parts[r-1].buffer(bridge - interference_tol, resolution=4)
+            if buf_prev.intersects(tuned_parts[r]): is_clashing = True
+            
+        for r in range(len(tuned_parts)):
+            buf_r = tuned_parts[r].buffer(bridge - interference_tol, resolution=4)
+            for step in [-1, 1]:
+                if buf_r.intersects(translate(tuned_parts[r], xoff=step*tune_pitch, yoff=0)):
+                    is_clashing = True
+        
+        for r in range(1, len(tuned_parts)):
+            buf_prev = tuned_parts[r-1].buffer(bridge - interference_tol, resolution=4)
+            for step in [-1, 1]:
+                if buf_prev.intersects(translate(tuned_parts[r], xoff=step*tune_pitch, yoff=0)):
+                    is_clashing = True
 
     if is_clashing:
         st.error(f"🚫 **간섭 경고:** 현재 설정된 피치({tune_pitch:.2f}mm) 또는 오프셋 위치에서는 인접한 부품끼리 겹치거나 최소 브릿지 간격({bridge}mm)을 침범합니다. 값을 넉넉하게 조정하세요.")
@@ -834,9 +815,8 @@ if uploaded_file is not None:
                  f"최소 폭({min_required_width:.2f}mm)보다 작습니다. 부품이 마진/캐리어 영역을 벗어날 수 있습니다.")
 
     # 원가 재계산
-    tune_util = (st.session_state['pair_area'] if is_pair else st.session_state['part_area']) / (tune_pitch * tune_width) * 100
-    cost_divisor = 2 if is_pair else 1
-    tune_cost = (((tune_pitch * tune_width * material_thickness) * material_density) / 1_000_000) * material_price / cost_divisor
+    tune_util = (st.session_state['part_area'] * len(tuned_parts)) / (tune_pitch * tune_width) * 100
+    tune_cost = (((tune_pitch * tune_width * material_thickness) * material_density) / 1_000_000) * material_price / len(tuned_parts)
 
     st.success(f"**미세조정 결과** ➔ 변경된 소재이용율: :blue[**{tune_util:.2f}%**]  |  변경된 1개당 단가: :blue[**{int(tune_cost):,}원**]")
 
@@ -844,7 +824,6 @@ if uploaded_file is not None:
     part_length_tuned = maxx - minx
     total_length_tuned = (tune_pitch * (total_stations - 1)) + part_length_tuned + (tune_pitch * 0.4)
     x_shift = -minx + (tune_pitch * 0.2)
-
     extra_width = max(0.0, tune_width - min_required_width)
     y_shift = -miny + margin + carrier_width + extra_width / 2
 
@@ -860,8 +839,13 @@ if uploaded_file is not None:
 
     for i in range(total_stations):
         for idx, geom in enumerate(tuned_parts):
-            color = ['#004b87', '#007934'][idx] if is_pair else '#004b87'
-            if tune_target_name == '지그재그 배열': color = ['#004b87', '#d55e00'][idx]
+            if "교차" in tune_target_name:
+                color = color_palette_i[idx % len(color_palette_i)]
+            elif "지그재그" in tune_target_name:
+                color = color_palette_z[idx % len(color_palette_z)]
+            else:
+                color = '#004b87'
+                
             shifted = translate(geom, xoff=x_shift + (i * tune_pitch), yoff=y_shift)
             plot_polygon(ax_tune, shifted, color, lw=1.5, alpha=0.7)
 
