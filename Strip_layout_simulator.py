@@ -16,8 +16,16 @@ import os
 import glob
 import hashlib
 import io
-import math
+import itertools
 from matplotlib.backends.backend_pdf import PdfPages
+
+# 브릿지(간섭) 판정용 buffer 근사 해상도. 값이 클수록 라운드/필렛 구간의 오프셋 곡선이
+# 정밀해지지만 연산량이 늘어난다. 4는 너무 거칠어 곡률부에서 실제 최소 간격과
+# 시뮬레이션 결과가 어긋날 수 있어 16으로 상향.
+BRIDGE_BUFFER_RESOLUTION = 16
+# 피치/오프셋 이진탐색 수렴 허용오차 (mm). 화면에 소수점 2자리로 표시되는 값의
+# 실제 정밀도를 보장하기 위해 표시 자릿수보다 한 단계 더 정밀하게 잡는다.
+GEOM_SEARCH_TOL = 0.005
 
 
 # ============================================================
@@ -70,27 +78,69 @@ def get_unit_factor(doc):
 # ============================================================
 # [1] 핵심 알고리즘 (Claude의 초정밀 Stacking 로직 융합)
 # ============================================================
-def calculate_1d_pitch(geom, bridge):
+def calculate_1d_pitch(geom, bridge, tol=GEOM_SEARCH_TOL):
+    """geom을 X축으로 dx만큼 평행이동한 사본이 자기 자신과 bridge 간격 이상
+    떨어지는 최소 dx(=피치)를 이진탐색으로 구한다.
+    dx=0은 항상 간섭(동일 위치)하고, dx=hi는 간섭하지 않도록 hi를 먼저 확보한 뒤
+    구간을 절반씩 좁혀나가므로, 부품 크기와 무관하게 tol 수준의 정밀도가 보장된다
+    (기존의 상대적 스텝(w/30, w/300) 방식은 큰 부품일수록 오차가 커지고,
+    폭이 0에 가까운 경우 스텝이 0이 되어 무한루프에 빠질 위험이 있었다)."""
     minx, miny, maxx, maxy = geom.bounds
-    w = maxx - minx
-    buffered_geom = geom.buffer(bridge, resolution=4)
-    dx, step = w + bridge, w / 30
+    w = max(maxx - minx, 1e-6)
+    buffered_geom = geom.buffer(bridge, resolution=BRIDGE_BUFFER_RESOLUTION)
 
-    while dx > 0:
-        if buffered_geom.intersects(translate(geom, xoff=dx, yoff=0)):
-            dx += step; break
-        dx -= step
-    if dx <= 0: dx = step
-    
-    fine_step = step / 10
-    while dx > 0:
-        if buffered_geom.intersects(translate(geom, xoff=dx, yoff=0)):
-            dx += fine_step; break
-        dx -= fine_step
-    return dx
+    lo, hi = 0.0, w + bridge
+    guard = 0
+    while buffered_geom.intersects(translate(geom, xoff=hi, yoff=0)) and guard < 20:
+        hi *= 1.5
+        guard += 1
+
+    while hi - lo > tol:
+        mid = (lo + hi) / 2
+        if buffered_geom.intersects(translate(geom, xoff=mid, yoff=0)):
+            lo = mid
+        else:
+            hi = mid
+    return hi
+
+def _min_y_gap(base_tiled, template, dx, y_start, y_floor, tol=GEOM_SEARCH_TOL):
+    """base_tiled(고정 형상들의 합집합)와 겹치지 않으면서 template를 X로 dx,
+    Y로 최대한 아래(y가 작은 쪽)로 내렸을 때의 최소 dy를 이진탐색으로 구한다.
+    y_start는 비간섭 상태를 가정한 시작값이지만, template가 part_a와 다른
+    형상/회전으로 인해 자체 바운딩박스 오프셋이 있는 경우(예: 180도 회전된
+    비대칭 형상) y_start에서도 간섭이 남아있을 수 있어, 비간섭이 확인될 때까지
+    위로 확장한다. y_floor까지 내려도 비간섭이면 유효한 접촉 경계가 없다는
+    뜻이므로 y_floor를 그대로 반환한다."""
+    hi = y_start
+    span = max(y_start - y_floor, 1.0)
+    guard = 0
+    while base_tiled.intersects(translate(template, xoff=dx, yoff=hi)) and guard < 20:
+        hi += span
+        guard += 1
+    if base_tiled.intersects(translate(template, xoff=dx, yoff=hi)):
+        return None  # 확장해도 간섭을 벗어나지 못함 -> 이 dx는 사용 불가
+
+    lo = y_floor
+    if not base_tiled.intersects(translate(template, xoff=dx, yoff=lo)):
+        return lo  # 탐색 하한까지도 간섭이 없는 극단적 경우
+
+    while hi - lo > tol:
+        mid = (lo + hi) / 2
+        if base_tiled.intersects(translate(template, xoff=dx, yoff=mid)):
+            lo = mid
+        else:
+            hi = mid
+    return hi
+
+def _dx_samples(p_base, target_step=0.5, min_n=90, max_n=400):
+    """탐색할 dx 격자점 수를 피치 크기에 맞춰 적응적으로 정한다.
+    고정 90분할은 피치가 큰 부품에서 격자 간격이 수 mm까지 벌어져
+    실제 최적 오프셋을 건너뛸 수 있어, 목표 간격(target_step)을 기준으로 늘린다."""
+    n = int(np.clip(p_base / target_step, min_n, max_n))
+    return np.linspace(0, p_base, n, endpoint=False)
 
 def find_nesting_offset(part_a, part_b, p_base, bridge):
-    buffered_a = part_a.buffer(bridge, resolution=4)
+    buffered_a = part_a.buffer(bridge, resolution=BRIDGE_BUFFER_RESOLUTION)
     minx, miny, maxx, maxy = part_a.bounds
     w, h = maxx - minx, maxy - miny
 
@@ -99,27 +149,12 @@ def find_nesting_offset(part_a, part_b, p_base, bridge):
     base_row = unary_union(base_geoms)
 
     best_dx, best_dy, best_part_b = 0, float('inf'), None
+    y_start = h + bridge * 2
+    y_floor = -h * 1.5
 
-    for dx in np.linspace(0, p_base, 90):
-        dy = h + bridge * 2  
-        step = max(0.5, min(h / 20, bridge / 2)) 
-        test_b = translate(part_b, xoff=dx, yoff=dy)
-
-        while not base_row.intersects(test_b):
-            dy -= step
-            if dy < -h * 1.5: break 
-            test_b = translate(part_b, xoff=dx, yoff=dy)
-
-        dy += step 
-        fine_step = step / 10
-        test_b = translate(part_b, xoff=dx, yoff=dy)
-
-        while not base_row.intersects(test_b):
-            dy -= fine_step
-            if dy < -h * 1.5: break
-            test_b = translate(part_b, xoff=dx, yoff=dy)
-        dy += fine_step 
-
+    for dx in _dx_samples(p_base):
+        dy = _min_y_gap(base_row, part_b, dx, y_start, y_floor)
+        if dy is None: continue
         if dy < best_dy:
             best_dy, best_dx, best_part_b = dy, dx, translate(part_b, xoff=dx, yoff=dy)
 
@@ -138,29 +173,13 @@ def _tile_row_x(buffered_geom, p_base, extra_reps=2):
 def _find_next_row(collision_base_tiled, new_part_template, start_y, p_base, bridge):
     minx, miny, maxx, maxy = new_part_template.bounds
     h = maxy - miny
-    top_start = start_y - miny + h + bridge * 2 
+    top_start = start_y - miny + h + bridge * 2
     floor_limit = start_y - h * 2.5
     best_dx, best_dy, best_part = 0, top_start, None
 
-    for dx in np.linspace(0, p_base, 90):
-        dy = top_start
-        step = max(0.5, min(h / 20, bridge / 2))
-        test = translate(new_part_template, xoff=dx, yoff=dy)
-
-        while not collision_base_tiled.intersects(test):
-            dy -= step
-            if dy < floor_limit: break
-            test = translate(new_part_template, xoff=dx, yoff=dy)
-        dy += step
-
-        fine_step = step / 10
-        test = translate(new_part_template, xoff=dx, yoff=dy)
-        while not collision_base_tiled.intersects(test):
-            dy -= fine_step
-            if dy < floor_limit: break
-            test = translate(new_part_template, xoff=dx, yoff=dy)
-        dy += fine_step
-
+    for dx in _dx_samples(p_base):
+        dy = _min_y_gap(collision_base_tiled, new_part_template, dx, top_start, floor_limit)
+        if dy is None: continue
         if dy < best_dy:
             best_dy, best_dx, best_part = dy, dx, translate(new_part_template, xoff=dx, yoff=dy)
 
@@ -168,22 +187,26 @@ def _find_next_row(collision_base_tiled, new_part_template, start_y, p_base, bri
 
 def build_stacked_rows(rotated_part, num_rows, p_base, bridge):
     rows_placed = [rotated_part]
-    collision_tiled = _tile_row_x(rotated_part.buffer(bridge, resolution=4), p_base)
+    collision_tiled = _tile_row_x(rotated_part.buffer(bridge, resolution=BRIDGE_BUFFER_RESOLUTION), p_base)
     current_top_y = rotated_part.bounds[3]
 
     for _ in range(1, max(1, num_rows)):
         dx, dy, placed = _find_next_row(collision_tiled, rotated_part, current_top_y, p_base, bridge)
         if placed is None: break
         rows_placed.append(placed)
-        collision_tiled = unary_union([collision_tiled, _tile_row_x(placed.buffer(bridge, resolution=4), p_base)])
+        collision_tiled = unary_union([collision_tiled, _tile_row_x(placed.buffer(bridge, resolution=BRIDGE_BUFFER_RESOLUTION), p_base)])
         current_top_y = max(current_top_y, placed.bounds[3])
     return rows_placed
 
 def check_multi_row_clash(parts, bridge):
+    """모든 행 쌍(인접하지 않은 조합 포함)에 대해 브릿지 간섭 여부를 검사한다.
+    기존에는 0행과 나머지 행만 비교해 예를 들어 1행-3행처럼 0행이 끼지 않는
+    조합의 간섭을 놓칠 수 있었다 (num_rows>=4에서 실제로 발생 가능)."""
     if len(parts) < 3: return False
-    buf0 = parts[0].buffer(bridge - 0.05, resolution=4)
-    for r in range(2, len(parts)):
-        if buf0.intersects(parts[r]): return True
+    for r1, r2 in itertools.combinations(range(len(parts)), 2):
+        if abs(r1 - r2) == 1: continue  # 인접 행은 배치 단계에서 이미 검증됨
+        buf = parts[r1].buffer(bridge - 0.05, resolution=BRIDGE_BUFFER_RESOLUTION)
+        if buf.intersects(parts[r2]): return True
     return False
 
 def row_colors(n):
@@ -194,7 +217,7 @@ def row_colors(n):
 # ============================================================
 # [2] DXF 읽기 및 시각화 (버그 픽스 + 블록 분해)
 # ============================================================
-def extract_entities_recursive(entity_container):
+def extract_entities_recursive(entity_container, fail_log=None):
     target_types = {'LWPOLYLINE', 'POLYLINE', 'CIRCLE', 'ELLIPSE', 'SPLINE'}
     extracted = []
     for entity in entity_container:
@@ -202,19 +225,21 @@ def extract_entities_recursive(entity_container):
             try:
                 for virt_entity in entity.virtual_entities():
                     if virt_entity.dxftype() == 'INSERT':
-                        extracted.extend(extract_entities_recursive([virt_entity]))
+                        extracted.extend(extract_entities_recursive([virt_entity], fail_log))
                     elif virt_entity.dxftype() in target_types:
                         extracted.append(virt_entity)
-            except Exception: pass
+            except Exception as e:
+                if fail_log is not None: fail_log.append(f"INSERT({entity.dxf.name if entity.dxf.hasattr('name') else '?'}): {e}")
         elif entity.dxftype() in target_types:
             extracted.append(entity)
     return extracted
 
 def read_part_with_holes(msp, unit_factor):
     candidates = []
-    flatten_tol = 0.1 if unit_factor == 0 else max(1e-4, 0.05 / unit_factor)
-    valid_entities = extract_entities_recursive(msp)
-    
+    fail_log = []
+    flatten_tol = max(1e-4, 0.05 / unit_factor)
+    valid_entities = extract_entities_recursive(msp, fail_log)
+
     for entity in valid_entities:
         try:
             p = path.make_path(entity)
@@ -224,23 +249,20 @@ def read_part_with_holes(msp, unit_factor):
             if poly.is_empty or poly.area < 1e-4: continue
             if poly.geom_type == 'MultiPolygon': poly = max(poly.geoms, key=lambda a: a.area)
             candidates.append(poly)
-        except Exception: continue
+        except Exception as e:
+            fail_log.append(f"{entity.dxftype()}: {e}")
 
-    if not candidates: return None, []
+    if not candidates: return None, [], fail_log
 
-    valid_outer_candidates, pure_circles = [], []
-    for poly in candidates:
-        area, perimeter = poly.area, poly.length
-        circularity = (4 * math.pi * area) / (perimeter ** 2) if perimeter > 0 else 0
-        if circularity > 0.95: pure_circles.append(poly)
-        else: valid_outer_candidates.append(poly)
-
-    if valid_outer_candidates: outer = max(valid_outer_candidates, key=lambda a: a.area)
-    else: outer = max(pure_circles, key=lambda a: a.area)
+    # 외곽 윤곽선은 정의상 모든 홀보다 항상 면적이 크므로(홀은 외곽 내부에 포함),
+    # 원형 여부(circularity)로 후보를 걸러낼 필요가 없다.
+    # 예전 로직은 부품 외곽 자체가 원형(와셔, 디스크 등)인데 내부에 비원형
+    # 홀(슬롯, D컷 등)이 하나라도 있으면 그 홀을 외곽선으로 오인하는 버그가 있었다.
+    outer = max(candidates, key=lambda a: a.area)
 
     holes = [c for c in candidates if c is not outer and outer.contains(c.buffer(-1e-6))]
     net_part = Polygon(outer.exterior.coords, [h.exterior.coords for h in holes]) if holes else outer
-    return net_part, holes
+    return net_part, holes, fail_log
 
 def plot_polygon(ax, poly, color, lw=1.5, alpha=0.5):
     verts, codes = [], []
@@ -488,7 +510,7 @@ if uploaded_file is not None:
             os.remove(tmp_path)
 
             unit_factor, unit_msg = get_unit_factor(doc)
-            part, holes = read_part_with_holes(msp, unit_factor)
+            part, holes, parse_fail_log = read_part_with_holes(msp, unit_factor)
             if part is None: st.error("❌ 다각형 정보를 찾을 수 없습니다."); st.stop()
             if part.geom_type == 'MultiPolygon': part = max(part.geoms, key=lambda a: a.area)
             part_area, pair_area = part.area, part.area * 2
@@ -556,15 +578,20 @@ if uploaded_file is not None:
                 'single': (single_results, best_s or fallback_s, not best_s),
                 'inter': (inter_results, best_i or fallback_i, not best_i),
                 'zigzag': (zigzag_results, best_z or fallback_z, not best_z),
-                'unit_msg': unit_msg
+                'unit_msg': unit_msg,
+                'parse_fail_log': parse_fail_log,
             })
             st.session_state.last_params = current_params
 
     s_res, best_s, s_fall = st.session_state['single']
     i_res, best_i, i_fall = st.session_state['inter']
     z_res, best_z, z_fall = st.session_state['zigzag']
-    
+
     st.caption(st.session_state['unit_msg'])
+    if st.session_state.get('parse_fail_log'):
+        with st.expander(f"⚠️ 도면 해석에 실패한 요소 {len(st.session_state['parse_fail_log'])}건 (형상/면적 계산에서 제외됨)"):
+            for msg in st.session_state['parse_fail_log']:
+                st.text(msg)
     if st.session_state['holes_count'] > 0: st.info(f"🕳️ 내측 홀 **{st.session_state['holes_count']}개** (순단면적 반영 완료)")
 
     cands = [('단일 배열', best_s)]
@@ -640,21 +667,25 @@ if uploaded_file is not None:
     all_geom_tuned = unary_union(tuned_parts)
     minx, miny, maxx, maxy = all_geom_tuned.bounds
 
-    interference_tol = 0.01  
+    interference_tol = 0.01
     is_clashing = False
     base_min_pitch = calculate_1d_pitch(tuned_parts[0], bridge)
     if tune_pitch < base_min_pitch - interference_tol: is_clashing = True
     else:
-        for r in range(1, n_parts):
-            if tuned_parts[r-1].buffer(bridge - interference_tol, resolution=4).intersects(tuned_parts[r]): is_clashing = True
+        # 모든 행 쌍(인접하지 않은 조합 포함)을 같은 스테이션 내 / ±피치 이동 상태 모두 검사한다.
+        # 기존에는 (r-1, r) 인접 쌍만 검사해 0행-2행처럼 인접하지 않은 행끼리의
+        # 간섭(특히 사용자가 행간 오프셋을 직접 조정할 때)을 놓칠 수 있었다.
+        row_bufs = [p.buffer(bridge - interference_tol, resolution=BRIDGE_BUFFER_RESOLUTION) for p in tuned_parts]
         for r in range(n_parts):
-            buf_r = tuned_parts[r].buffer(bridge - interference_tol, resolution=4)
             for step in [-1, 1]:
-                if buf_r.intersects(translate(tuned_parts[r], xoff=step*tune_pitch, yoff=0)): is_clashing = True
-        for r in range(1, n_parts):
-            buf_prev = tuned_parts[r-1].buffer(bridge - interference_tol, resolution=4)
+                if row_bufs[r].intersects(translate(tuned_parts[r], xoff=step*tune_pitch, yoff=0)):
+                    is_clashing = True
+        for r1, r2 in itertools.combinations(range(n_parts), 2):
+            if row_bufs[r1].intersects(tuned_parts[r2]):
+                is_clashing = True
             for step in [-1, 1]:
-                if buf_prev.intersects(translate(tuned_parts[r], xoff=step*tune_pitch, yoff=0)): is_clashing = True
+                if row_bufs[r1].intersects(translate(tuned_parts[r2], xoff=step*tune_pitch, yoff=0)):
+                    is_clashing = True
 
     if is_clashing: st.error(f"🚫 **간섭 경고:** 부품 간격이 브릿지({bridge}mm)를 침범합니다.")
     req_w = (maxy - miny) + margin * 2 + carrier_width * 2
