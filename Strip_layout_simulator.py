@@ -20,12 +20,15 @@ import itertools
 from matplotlib.backends.backend_pdf import PdfPages
 
 # 브릿지(간섭) 판정용 buffer 근사 해상도. 값이 클수록 라운드/필렛 구간의 오프셋 곡선이
-# 정밀해지지만 연산량이 늘어난다. 4는 너무 거칠어 곡률부에서 실제 최소 간격과
-# 시뮬레이션 결과가 어긋날 수 있어 16으로 상향.
-BRIDGE_BUFFER_RESOLUTION = 16
-# 피치/오프셋 이진탐색 수렴 허용오차 (mm). 화면에 소수점 2자리로 표시되는 값의
-# 실제 정밀도를 보장하기 위해 표시 자릿수보다 한 단계 더 정밀하게 잡는다.
+# 정밀해지지만 shapely intersects() 연산이 느려진다. 4는 너무 거칠어 곡률부에서
+# 실제 최소 간격과 시뮬레이션 결과가 어긋날 수 있어 8로 상향 (정확도와 속도의 절충점).
+BRIDGE_BUFFER_RESOLUTION = 8
+# 피치 계산(각도당 1회 호출) 수렴 허용오차 (mm).
 GEOM_SEARCH_TOL = 0.005
+# 행간 오프셋 탐색(각도당 dx 격자점 수만큼 반복 호출) 수렴 허용오차 (mm).
+# calculate_1d_pitch보다 훨씬 자주 호출되므로 화면 표시 정밀도(소수점 2자리)에
+# 지장 없는 선에서 다소 느슨하게 잡아 연산량을 줄인다.
+ROW_SEARCH_TOL = 0.02
 
 
 # ============================================================
@@ -103,7 +106,7 @@ def calculate_1d_pitch(geom, bridge, tol=GEOM_SEARCH_TOL):
             hi = mid
     return hi
 
-def _min_y_gap(base_tiled, template, dx, y_start, y_floor, tol=GEOM_SEARCH_TOL, coarse_n=60):
+def _min_y_gap(base_tiled, template, dx, y_start, y_floor, tol=ROW_SEARCH_TOL, coarse_n=24):
     """base_tiled(고정 형상들의 합집합)와 겹치지 않으면서 template를 X로 dx,
     Y로 최대한 아래(y가 작은 쪽)로 내렸을 때의 최소 dy를 구한다.
     y_start는 비간섭 상태를 가정한 시작값이지만, template가 part_a와 다른
@@ -148,10 +151,14 @@ def _min_y_gap(base_tiled, template, dx, y_start, y_floor, tol=GEOM_SEARCH_TOL, 
             hi = mid
     return hi
 
-def _dx_samples(p_base, target_step=0.5, min_n=90, max_n=400):
+def _dx_samples(p_base, target_step=1.5, min_n=48, max_n=140):
     """탐색할 dx 격자점 수를 피치 크기에 맞춰 적응적으로 정한다.
     고정 90분할은 피치가 큰 부품에서 격자 간격이 수 mm까지 벌어져
-    실제 최적 오프셋을 건너뛸 수 있어, 목표 간격(target_step)을 기준으로 늘린다."""
+    실제 최적 오프셋을 건너뛸 수 있어, 목표 간격(target_step)을 기준으로 늘린다.
+    각도(최대 36개) x dx 격자점 x 부품 쌍마다 _min_y_gap(내부에서 최대 수십 회
+    intersects 호출)이 반복 호출되므로, 격자점 수가 커지면 전체 연산량이 급격히
+    늘어난다. min_n/max_n을 너무 크게 잡으면 복잡한 실제 DXF 부품에서 재계산이
+    체감될 정도로 느려질 수 있어 실용적인 범위로 제한한다."""
     n = int(np.clip(p_base / target_step, min_n, max_n))
     return np.linspace(0, p_base, n, endpoint=False)
 
@@ -480,7 +487,7 @@ st.sidebar.header("🔧 3. 캐리어 & 파일럿")
 carrier_width = st.sidebar.number_input("캐리어 폭 (mm)", value=float(round(max(4.0, 3*material_thickness), 1)), step=0.5)
 pilot_dia = st.sidebar.number_input("파일럿 홀 지름 (mm)", value=4.0, step=0.5)
 
-st.sidebar.header("🛠️ 4. 공도도 설계")
+st.sidebar.header("🛠️ 4. 레이아웃 설계")
 st_notch = st.sidebar.number_input("노칭 / 파일럿 홀", value=1, step=1)
 st_pierce = st.sidebar.number_input("피어싱", value=1, step=1)
 st_bend = st.sidebar.number_input("벤딩", value=0, step=1)
