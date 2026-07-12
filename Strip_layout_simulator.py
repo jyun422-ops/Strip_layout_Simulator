@@ -106,7 +106,7 @@ def calculate_1d_pitch(geom, bridge, tol=GEOM_SEARCH_TOL):
             hi = mid
     return hi
 
-def _min_y_gap(base_tiled, template, dx, y_start, y_floor, tol=ROW_SEARCH_TOL, coarse_n=24):
+def _min_y_gap(base_tiled, template, dx, y_start, y_floor, coarse_step, tol=ROW_SEARCH_TOL):
     """base_tiled(고정 형상들의 합집합)와 겹치지 않으면서 template를 X로 dx,
     Y로 최대한 아래(y가 작은 쪽)로 내렸을 때의 최소 dy를 구한다.
     y_start는 비간섭 상태를 가정한 시작값이지만, template가 part_a와 다른
@@ -118,8 +118,12 @@ def _min_y_gap(base_tiled, template, dx, y_start, y_floor, tol=ROW_SEARCH_TOL, c
     그래서 [y_floor, hi] 구간의 양 끝만 보고 바로 이진탐색을 하면 중간의 실제
     접촉 구간을 건너뛰고 y_floor를 "완전히 비어있는 안전한 자리"로 오판해
     부품이 극단적으로 멀리 떨어진(비정상적으로 넓은 소재폭) 결과를 낼 수 있다.
-    이를 막기 위해 먼저 hi에서부터 굵은 간격으로 내려가며 '처음 간섭이
-    시작되는 지점'을 찾고, 그 좁은 구간 안에서만 이진탐색으로 정밀화한다."""
+    이를 막기 위해 먼저 hi에서부터 굵은 간격(coarse_step)으로 내려가며 '처음
+    간섭이 시작되는 지점'을 찾고, 그 좁은 구간 안에서만 이진탐색으로 정밀화한다.
+    coarse_step은 호출부에서 bridge(최소 브릿지 폭) 기준으로 정해 전달한다 —
+    이 폭보다 좁은 진짜 맞물림 틈은 애초에 실제 금형에서 의미가 없고, 반대로
+    이 스텝이 bridge보다 크면 실존하는 좁은 맞물림 구간을 건너뛰어 "배치 불가"로
+    잘못 판정할 위험이 있다."""
     hi = y_start
     span = max(y_start - y_floor, 1.0)
     guard = 0
@@ -129,7 +133,7 @@ def _min_y_gap(base_tiled, template, dx, y_start, y_floor, tol=ROW_SEARCH_TOL, c
     if base_tiled.intersects(translate(template, xoff=dx, yoff=hi)):
         return None  # 확장해도 간섭을 벗어나지 못함 -> 이 dx는 사용 불가
 
-    coarse_step = max((hi - y_floor) / coarse_n, tol)
+    coarse_step = max(coarse_step, tol)
     safe_y, y = hi, hi
     contact_lo = None
     while y > y_floor:
@@ -162,6 +166,12 @@ def _dx_samples(p_base, target_step=1.5, min_n=48, max_n=140):
     n = int(np.clip(p_base / target_step, min_n, max_n))
     return np.linspace(0, p_base, n, endpoint=False)
 
+def _row_coarse_step(h, bridge):
+    """행간 접촉점을 찾는 굵은 탐색의 스텝 크기.
+    bridge/2보다 크게 잡으면 브릿지 폭 정도의 좁은 맞물림 구간을 건너뛰어
+    '배치 불가'로 잘못 판정할 수 있어 bridge에 비례하도록 상한을 둔다."""
+    return max(0.5, min(h / 20, bridge / 2))
+
 def find_nesting_offset(part_a, part_b, p_base, bridge):
     buffered_a = part_a.buffer(bridge, resolution=BRIDGE_BUFFER_RESOLUTION)
     minx, miny, maxx, maxy = part_a.bounds
@@ -174,9 +184,10 @@ def find_nesting_offset(part_a, part_b, p_base, bridge):
     best_dx, best_dy, best_part_b = 0, float('inf'), None
     y_start = h + bridge * 2
     y_floor = -h * 1.5
+    coarse_step = _row_coarse_step(h, bridge)
 
     for dx in _dx_samples(p_base):
-        dy = _min_y_gap(base_row, part_b, dx, y_start, y_floor)
+        dy = _min_y_gap(base_row, part_b, dx, y_start, y_floor, coarse_step)
         if dy is None: continue
         if dy < best_dy:
             best_dy, best_dx, best_part_b = dy, dx, translate(part_b, xoff=dx, yoff=dy)
@@ -199,9 +210,10 @@ def _find_next_row(collision_base_tiled, new_part_template, start_y, p_base, bri
     top_start = start_y - miny + h + bridge * 2
     floor_limit = start_y - h * 2.5
     best_dx, best_dy, best_part = 0, top_start, None
+    coarse_step = _row_coarse_step(h, bridge)
 
     for dx in _dx_samples(p_base):
-        dy = _min_y_gap(collision_base_tiled, new_part_template, dx, top_start, floor_limit)
+        dy = _min_y_gap(collision_base_tiled, new_part_template, dx, top_start, floor_limit, coarse_step)
         if dy is None: continue
         if dy < best_dy:
             best_dy, best_dx, best_part = dy, dx, translate(new_part_template, xoff=dx, yoff=dy)
