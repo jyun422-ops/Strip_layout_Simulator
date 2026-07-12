@@ -103,14 +103,20 @@ def calculate_1d_pitch(geom, bridge, tol=GEOM_SEARCH_TOL):
             hi = mid
     return hi
 
-def _min_y_gap(base_tiled, template, dx, y_start, y_floor, tol=GEOM_SEARCH_TOL):
+def _min_y_gap(base_tiled, template, dx, y_start, y_floor, tol=GEOM_SEARCH_TOL, coarse_n=60):
     """base_tiled(고정 형상들의 합집합)와 겹치지 않으면서 template를 X로 dx,
-    Y로 최대한 아래(y가 작은 쪽)로 내렸을 때의 최소 dy를 이진탐색으로 구한다.
+    Y로 최대한 아래(y가 작은 쪽)로 내렸을 때의 최소 dy를 구한다.
     y_start는 비간섭 상태를 가정한 시작값이지만, template가 part_a와 다른
     형상/회전으로 인해 자체 바운딩박스 오프셋이 있는 경우(예: 180도 회전된
     비대칭 형상) y_start에서도 간섭이 남아있을 수 있어, 비간섭이 확인될 때까지
-    위로 확장한다. y_floor까지 내려도 비간섭이면 유효한 접촉 경계가 없다는
-    뜻이므로 y_floor를 그대로 반환한다."""
+    위로 확장한다.
+    오목한(concave) 형상은 dy에 대한 간섭 여부가 단조롭지 않을 수 있다
+    (예: 위에서 내려오다 한 번 닿았다가 다시 떨어지고 더 아래에서 다시 닿는 경우).
+    그래서 [y_floor, hi] 구간의 양 끝만 보고 바로 이진탐색을 하면 중간의 실제
+    접촉 구간을 건너뛰고 y_floor를 "완전히 비어있는 안전한 자리"로 오판해
+    부품이 극단적으로 멀리 떨어진(비정상적으로 넓은 소재폭) 결과를 낼 수 있다.
+    이를 막기 위해 먼저 hi에서부터 굵은 간격으로 내려가며 '처음 간섭이
+    시작되는 지점'을 찾고, 그 좁은 구간 안에서만 이진탐색으로 정밀화한다."""
     hi = y_start
     span = max(y_start - y_floor, 1.0)
     guard = 0
@@ -120,10 +126,20 @@ def _min_y_gap(base_tiled, template, dx, y_start, y_floor, tol=GEOM_SEARCH_TOL):
     if base_tiled.intersects(translate(template, xoff=dx, yoff=hi)):
         return None  # 확장해도 간섭을 벗어나지 못함 -> 이 dx는 사용 불가
 
-    lo = y_floor
-    if not base_tiled.intersects(translate(template, xoff=dx, yoff=lo)):
-        return lo  # 탐색 하한까지도 간섭이 없는 극단적 경우
+    coarse_step = max((hi - y_floor) / coarse_n, tol)
+    safe_y, y = hi, hi
+    contact_lo = None
+    while y > y_floor:
+        y -= coarse_step
+        if base_tiled.intersects(translate(template, xoff=dx, yoff=y)):
+            contact_lo = y
+            break
+        safe_y = y
 
+    if contact_lo is None:
+        return None  # 바닥까지 내려도 실질적인 접촉이 전혀 없는 dx -> 유효한 후보 아님
+
+    lo, hi = contact_lo, safe_y
     while hi - lo > tol:
         mid = (lo + hi) / 2
         if base_tiled.intersects(translate(template, xoff=dx, yoff=mid)):
