@@ -493,7 +493,7 @@ bridge = st.sidebar.number_input("부품간 최소 간격 (mm)", value=float(rou
 margin = st.sidebar.number_input("가장자리 마진 (mm)", value=float(round(rec_margin, 1)), step=0.1)
 
 st.sidebar.header("🧱 3-1. 다열(N행) 설정")
-num_rows = st.sidebar.number_input("배치 행 수 (2행 이상)", value=2, min_value=2, max_value=8, step=1, help="다열 배열 시뮬레이션에 적용됩니다. 단일 배열은 1열로 고정됩니다.")
+num_rows = st.sidebar.number_input("배치 행 수", value=2, min_value=2, max_value=2, step=1, help="다열(교차/지그재그) 배열 시뮬레이션에 적용됩니다. 단일 배열은 1열로 고정됩니다. 계산 속도를 위해 2행으로 제한되어 있습니다.")
 
 st.sidebar.header("🔧 3. 캐리어 & 파일럿")
 carrier_width = st.sidebar.number_input("캐리어 폭 (mm)", value=float(round(max(4.0, 3*material_thickness), 1)), step=0.5)
@@ -536,8 +536,8 @@ recalculated = False
 
 if uploaded_file is not None:
     if st.session_state.last_params != current_params:
-        recalculated = True 
-        with st.spinner('안전 간격 및 다열(Multi-row) 파고들기를 분석 중입니다...'):
+        recalculated = True
+        with st.spinner('도면을 읽는 중입니다...'):
             with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp:
                 tmp.write(uploaded_file.getvalue()); tmp_path = tmp.name
             doc = ezdxf.readfile(tmp_path)
@@ -550,73 +550,77 @@ if uploaded_file is not None:
             if part.geom_type == 'MultiPolygon': part = max(part.geoms, key=lambda a: a.area)
             part_area, pair_area = part.area, part.area * 2
 
-            single_results, inter_results, zigzag_results = [], [], []
-            best_s = best_i = best_z = fallback_s = fallback_i = fallback_z = None
+        single_results, inter_results, zigzag_results = [], [], []
+        best_s = best_i = best_z = fallback_s = fallback_i = fallback_z = None
 
-            for angle in range(0, 180, angle_step):
-                rotated_part = rotate(part, angle, origin='centroid')
-                p_base = calculate_1d_pitch(rotated_part, bridge)
+        angles = list(range(0, 180, angle_step))
+        progress_bar = st.progress(0.0, text=f"각도별 최적 배열 탐색 중... (0/{len(angles)})")
+        for step_idx, angle in enumerate(angles):
+            progress_bar.progress((step_idx + 1) / len(angles), text=f"각도별 최적 배열 탐색 중... ({step_idx + 1}/{len(angles)})")
+            rotated_part = rotate(part, angle, origin='centroid')
+            p_base = calculate_1d_pitch(rotated_part, bridge)
 
-                valid = True
-                if apply_rolling_constraint:
-                    for b_angle in bend_line_angles:
-                        eff_angle = (b_angle + angle) % 180
-                        if min(eff_angle, 180 - eff_angle) < min_angle_from_rolling:
-                            valid = False; break
+            valid = True
+            if apply_rolling_constraint:
+                for b_angle in bend_line_angles:
+                    eff_angle = (b_angle + angle) % 180
+                    if min(eff_angle, 180 - eff_angle) < min_angle_from_rolling:
+                        valid = False; break
 
-                # [1] 단일 배열 계산
-                minx, miny, maxx, maxy = rotated_part.bounds
-                w_s = (maxy - miny) + margin * 2 + carrier_width * 2
-                util_s = (part_area / (p_base * w_s)) * 100
-                cost_s = (((p_base * w_s * material_thickness) * material_density) / 1_000_000) * material_price
-                rec_s = {'util': util_s, 'cost': cost_s, 'angle': angle, 'parts': [rotated_part], 'w': w_s, 'p': p_base}
-                single_results.append({'각도': f"{angle}°", '피치(mm)': round(p_base, 2), '소재폭(mm)': round(w_s, 2), '소재이용율(%)': round(util_s, 2), '1개당 원가(원)': int(cost_s), '압연방향 적합': 'O' if valid else 'X'})
-                if not fallback_s or util_s > fallback_s['util']: fallback_s = rec_s
-                if valid and (not best_s or util_s > best_s['util']): best_s = rec_s
+            # [1] 단일 배열 계산
+            minx, miny, maxx, maxy = rotated_part.bounds
+            w_s = (maxy - miny) + margin * 2 + carrier_width * 2
+            util_s = (part_area / (p_base * w_s)) * 100
+            cost_s = (((p_base * w_s * material_thickness) * material_density) / 1_000_000) * material_price
+            rec_s = {'util': util_s, 'cost': cost_s, 'angle': angle, 'parts': [rotated_part], 'w': w_s, 'p': p_base}
+            single_results.append({'각도': f"{angle}°", '피치(mm)': round(p_base, 2), '소재폭(mm)': round(w_s, 2), '소재이용율(%)': round(util_s, 2), '1개당 원가(원)': int(cost_s), '압연방향 적합': 'O' if valid else 'X'})
+            if not fallback_s or util_s > fallback_s['util']: fallback_s = rec_s
+            if valid and (not best_s or util_s > best_s['util']): best_s = rec_s
 
-                # [2] N열 교차 배열 (Fast Vector Copy)
-                part_180 = rotate(rotated_part, 180, origin='centroid')
-                dx_i1, dy_i1, _, _ = find_nesting_offset(rotated_part, part_180, p_base, bridge)
-                if dx_i1 is not None:
-                    dx_i2, dy_i2, _, _ = find_nesting_offset(part_180, rotated_part, p_base, bridge)
-                    if dx_i2 is not None:
-                        i_parts = [rotated_part]
-                        cx, cy = 0.0, 0.0
-                        for r in range(1, num_rows):
-                            if r % 2 == 1: cx += dx_i1; cy += dy_i1; i_parts.append(translate(part_180, xoff=cx, yoff=cy))
-                            else: cx += dx_i2; cy += dy_i2; i_parts.append(translate(rotated_part, xoff=cx, yoff=cy))
-                        if not check_multi_row_clash(i_parts, bridge):
-                            geom_i = unary_union(i_parts)
-                            w_i = (geom_i.bounds[3] - geom_i.bounds[1]) + margin * 2 + carrier_width * 2
-                            util_i = (part_area * num_rows / (p_base * w_i)) * 100
-                            cost_i = (((p_base * w_i * material_thickness) * material_density) / 1_000_000) * material_price / num_rows
-                            rec_i = {'util': util_i, 'cost': cost_i, 'angle': angle, 'parts': i_parts, 'w': w_i, 'p': p_base}
-                            inter_results.append({'각도': f"{angle}°", '피치(mm)': round(p_base, 2), '소재폭(mm)': round(w_i, 2), '소재이용율(%)': round(util_i, 2), '1개당 원가(원)': int(cost_i), '압연방향 적합': 'O' if valid else 'X'})
-                            if not fallback_i or util_i > fallback_i['util']: fallback_i = rec_i
-                            if valid and (not best_i or util_i > best_i['util']): best_i = rec_i
+            # [2] N열 교차 배열 (Fast Vector Copy)
+            part_180 = rotate(rotated_part, 180, origin='centroid')
+            dx_i1, dy_i1, _, _ = find_nesting_offset(rotated_part, part_180, p_base, bridge)
+            if dx_i1 is not None:
+                dx_i2, dy_i2, _, _ = find_nesting_offset(part_180, rotated_part, p_base, bridge)
+                if dx_i2 is not None:
+                    i_parts = [rotated_part]
+                    cx, cy = 0.0, 0.0
+                    for r in range(1, num_rows):
+                        if r % 2 == 1: cx += dx_i1; cy += dy_i1; i_parts.append(translate(part_180, xoff=cx, yoff=cy))
+                        else: cx += dx_i2; cy += dy_i2; i_parts.append(translate(rotated_part, xoff=cx, yoff=cy))
+                    if not check_multi_row_clash(i_parts, bridge):
+                        geom_i = unary_union(i_parts)
+                        w_i = (geom_i.bounds[3] - geom_i.bounds[1]) + margin * 2 + carrier_width * 2
+                        util_i = (part_area * num_rows / (p_base * w_i)) * 100
+                        cost_i = (((p_base * w_i * material_thickness) * material_density) / 1_000_000) * material_price / num_rows
+                        rec_i = {'util': util_i, 'cost': cost_i, 'angle': angle, 'parts': i_parts, 'w': w_i, 'p': p_base}
+                        inter_results.append({'각도': f"{angle}°", '피치(mm)': round(p_base, 2), '소재폭(mm)': round(w_i, 2), '소재이용율(%)': round(util_i, 2), '1개당 원가(원)': int(cost_i), '압연방향 적합': 'O' if valid else 'X'})
+                        if not fallback_i or util_i > fallback_i['util']: fallback_i = rec_i
+                        if valid and (not best_i or util_i > best_i['util']): best_i = rec_i
 
-                # [3] N열 지그재그 배열 (Claude's Stacking Algorithm)
-                zigzag_rows = build_stacked_rows(rotated_part, num_rows, p_base, bridge)
-                n_rows_actual = len(zigzag_rows)
-                if n_rows_actual >= 2:
-                    geom_z_full = unary_union(zigzag_rows)
-                    w_z = (geom_z_full.bounds[3] - geom_z_full.bounds[1]) + margin * 2 + carrier_width * 2
-                    util_z = (part_area * n_rows_actual / (p_base * w_z)) * 100
-                    cost_z = (((p_base * w_z * material_thickness) * material_density) / 1_000_000) * material_price / n_rows_actual
-                    rec_z = {'util': util_z, 'cost': cost_z, 'angle': angle, 'parts': zigzag_rows, 'w': w_z, 'p': p_base, 'n_rows': n_rows_actual}
-                    zigzag_results.append({'각도': f"{angle}°", '피치(mm)': round(p_base, 2), '소재폭(mm)': round(w_z, 2), '소재이용율(%)': round(util_z, 2), '1개당 원가(원)': int(cost_z), '압연방향 적합': 'O' if valid else 'X'})
-                    if not fallback_z or util_z > fallback_z['util']: fallback_z = rec_z
-                    if valid and (not best_z or util_z > best_z['util']): best_z = rec_z
+            # [3] N열 지그재그 배열 (Claude's Stacking Algorithm)
+            zigzag_rows = build_stacked_rows(rotated_part, num_rows, p_base, bridge)
+            n_rows_actual = len(zigzag_rows)
+            if n_rows_actual >= 2:
+                geom_z_full = unary_union(zigzag_rows)
+                w_z = (geom_z_full.bounds[3] - geom_z_full.bounds[1]) + margin * 2 + carrier_width * 2
+                util_z = (part_area * n_rows_actual / (p_base * w_z)) * 100
+                cost_z = (((p_base * w_z * material_thickness) * material_density) / 1_000_000) * material_price / n_rows_actual
+                rec_z = {'util': util_z, 'cost': cost_z, 'angle': angle, 'parts': zigzag_rows, 'w': w_z, 'p': p_base, 'n_rows': n_rows_actual}
+                zigzag_results.append({'각도': f"{angle}°", '피치(mm)': round(p_base, 2), '소재폭(mm)': round(w_z, 2), '소재이용율(%)': round(util_z, 2), '1개당 원가(원)': int(cost_z), '압연방향 적합': 'O' if valid else 'X'})
+                if not fallback_z or util_z > fallback_z['util']: fallback_z = rec_z
+                if valid and (not best_z or util_z > best_z['util']): best_z = rec_z
 
-            st.session_state.update({
-                'part_area': part_area, 'holes_count': len(holes), 'holes_area': sum(h.area for h in holes) if holes else 0.0,
-                'single': (single_results, best_s or fallback_s, not best_s),
-                'inter': (inter_results, best_i or fallback_i, not best_i),
-                'zigzag': (zigzag_results, best_z or fallback_z, not best_z),
-                'unit_msg': unit_msg,
-                'parse_fail_log': parse_fail_log,
-            })
-            st.session_state.last_params = current_params
+        progress_bar.empty()
+        st.session_state.update({
+            'part_area': part_area, 'holes_count': len(holes), 'holes_area': sum(h.area for h in holes) if holes else 0.0,
+            'single': (single_results, best_s or fallback_s, not best_s),
+            'inter': (inter_results, best_i or fallback_i, not best_i),
+            'zigzag': (zigzag_results, best_z or fallback_z, not best_z),
+            'unit_msg': unit_msg,
+            'parse_fail_log': parse_fail_log,
+        })
+        st.session_state.last_params = current_params
 
     s_res, best_s, s_fall = st.session_state['single']
     i_res, best_i, i_fall = st.session_state['inter']
@@ -757,11 +761,23 @@ if uploaded_file is not None:
     # ============================================================
     st.divider()
     st.header("💾 [4단계] 데이터 추출 및 내보내기")
-    
-    dxf_bytes = generate_dxf_bytes(tuned_parts, tune_pitch, tune_width, total_stations, margin, carrier_width, pilot_dia, x_shift, y_shift)
-    excel_bytes = generate_excel_report(tune_target_name, tune_pitch, tune_width, tune_util, tune_cost, total_stations, mat_type, material_thickness, material_price, material_density, s_res, i_res, z_res)
-    pdf_bytes = generate_pdf_report(fig_tune, tune_target_name, tune_pitch, tune_width, tune_util, tune_cost, total_stations, mat_type, material_thickness)
-    
+
+    # 튜닝 값이 실제로 안 바뀌었으면(예: 다른 위젯을 건드려 화면이 다시 그려진 경우)
+    # DXF/Excel/PDF를 다시 만들지 않고 직전 결과를 재사용한다.
+    export_sig = (file_hash, tune_target_name, tune_angle, tune_pitch, tune_width,
+                  tune_y_all, tune_x_step, tune_y_step, total_stations, margin,
+                  carrier_width, pilot_dia, mat_type, material_thickness,
+                  material_price, material_density)
+    cached_export = st.session_state.get('export_cache')
+    if cached_export and cached_export[0] == export_sig:
+        dxf_bytes, excel_bytes, pdf_bytes = cached_export[1:]
+    else:
+        dxf_bytes = generate_dxf_bytes(tuned_parts, tune_pitch, tune_width, total_stations, margin, carrier_width, pilot_dia, x_shift, y_shift)
+        excel_bytes = generate_excel_report(tune_target_name, tune_pitch, tune_width, tune_util, tune_cost, total_stations, mat_type, material_thickness, material_price, material_density, s_res, i_res, z_res)
+        pdf_bytes = generate_pdf_report(fig_tune, tune_target_name, tune_pitch, tune_width, tune_util, tune_cost, total_stations, mat_type, material_thickness)
+        st.session_state['export_cache'] = (export_sig, dxf_bytes, excel_bytes, pdf_bytes)
+
+
     col_dxf, col_xls, col_pdf = st.columns(3)
     with col_dxf: st.download_button("📥 DXF 도면 다운로드", data=dxf_bytes, file_name="optimized_strip.dxf", mime="application/dxf", type="primary", use_container_width=True)
     with col_xls: st.download_button("📥 Excel 데이터 다운로드", data=excel_bytes, file_name="layout_report.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary", use_container_width=True)
