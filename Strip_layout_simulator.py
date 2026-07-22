@@ -19,17 +19,9 @@ import io
 import itertools
 from matplotlib.backends.backend_pdf import PdfPages
 
-# 브릿지(간섭) 판정용 buffer 근사 해상도. 값이 클수록 라운드/필렛 구간의 오프셋 곡선이
-# 정밀해지지만 shapely intersects() 연산이 느려진다. 4는 너무 거칠어 곡률부에서
-# 실제 최소 간격과 시뮬레이션 결과가 어긋날 수 있어 8로 상향 (정확도와 속도의 절충점).
 BRIDGE_BUFFER_RESOLUTION = 8
-# 피치 계산(각도당 1회 호출) 수렴 허용오차 (mm).
 GEOM_SEARCH_TOL = 0.005
-# 행간 오프셋 탐색(각도당 dx 격자점 수만큼 반복 호출) 수렴 허용오차 (mm).
-# calculate_1d_pitch보다 훨씬 자주 호출되므로 화면 표시 정밀도(소수점 2자리)에
-# 지장 없는 선에서 다소 느슨하게 잡아 연산량을 줄인다.
 ROW_SEARCH_TOL = 0.02
-
 
 # ============================================================
 # [-1] matplotlib 한글 폰트 자동 설정
@@ -77,17 +69,43 @@ def get_unit_factor(doc):
     if factor == 1.0: return 1.0, "✅ 도면 단위: mm (변환 불필요)"
     return factor, f"✅ 도면 단위 자동 인식 (환산 계수 ×{factor} 적용)"
 
+# ============================================================
+# [NEW] 공정 자동 기획 엔진 (Sequence Logic Engine)
+# ============================================================
+def generate_sequence_layout(holes_count, apply_rolling_constraint, bend_angles_count):
+    """
+    추출된 특징(Hole 개수, 벤딩 조건)을 바탕으로 초기 예상 스트립 공정을 기획합니다.
+    """
+    stages = []
+    s_idx = 1
+    
+    if holes_count > 0:
+        stages.append({"스테이션": s_idx, "공정명": "Pilot & Piercing", "상세": f"내부 홀({holes_count}개) 타발"})
+    else:
+        stages.append({"스테이션": s_idx, "공정명": "Pilot", "상세": "이송용 파일럿 홀 타발"})
+    s_idx += 1
+    
+    stages.append({"스테이션": s_idx, "공정명": "Notching 1", "상세": "외곽 릴리프 타발 1차"})
+    s_idx += 1
+    
+    if apply_rolling_constraint or bend_angles_count > 0:
+        stages.append({"스테이션": s_idx, "공정명": "Notching 2", "상세": "외곽 릴리프 타발 2차"})
+        s_idx += 1
+        stages.append({"스테이션": s_idx, "공정명": "Idle", "상세": "벤딩 전 다이 강성 확보"})
+        s_idx += 1
+        bends = bend_angles_count if bend_angles_count > 0 else 1
+        for i in range(bends):
+            stages.append({"스테이션": s_idx, "공정명": f"Bending {i+1}", "상세": "플랜지 절곡 성형"})
+            s_idx += 1
+            
+    stages.append({"스테이션": s_idx, "공정명": "Cut-off", "상세": "최종 제품 분리 및 낙하"})
+    
+    return pd.DataFrame(stages)
 
 # ============================================================
-# [1] 핵심 알고리즘 (Claude의 초정밀 Stacking 로직 융합)
+# [1] 핵심 알고리즘 (Stacking 로직)
 # ============================================================
 def calculate_1d_pitch(geom, bridge, tol=GEOM_SEARCH_TOL):
-    """geom을 X축으로 dx만큼 평행이동한 사본이 자기 자신과 bridge 간격 이상
-    떨어지는 최소 dx(=피치)를 이진탐색으로 구한다.
-    dx=0은 항상 간섭(동일 위치)하고, dx=hi는 간섭하지 않도록 hi를 먼저 확보한 뒤
-    구간을 절반씩 좁혀나가므로, 부품 크기와 무관하게 tol 수준의 정밀도가 보장된다
-    (기존의 상대적 스텝(w/30, w/300) 방식은 큰 부품일수록 오차가 커지고,
-    폭이 0에 가까운 경우 스텝이 0이 되어 무한루프에 빠질 위험이 있었다)."""
     minx, miny, maxx, maxy = geom.bounds
     w = max(maxx - minx, 1e-6)
     buffered_geom = geom.buffer(bridge, resolution=BRIDGE_BUFFER_RESOLUTION)
@@ -107,23 +125,6 @@ def calculate_1d_pitch(geom, bridge, tol=GEOM_SEARCH_TOL):
     return hi
 
 def _min_y_gap(base_tiled, template, dx, y_start, y_floor, coarse_step, tol=ROW_SEARCH_TOL):
-    """base_tiled(고정 형상들의 합집합)와 겹치지 않으면서 template를 X로 dx,
-    Y로 최대한 아래(y가 작은 쪽)로 내렸을 때의 최소 dy를 구한다.
-    y_start는 비간섭 상태를 가정한 시작값이지만, template가 part_a와 다른
-    형상/회전으로 인해 자체 바운딩박스 오프셋이 있는 경우(예: 180도 회전된
-    비대칭 형상) y_start에서도 간섭이 남아있을 수 있어, 비간섭이 확인될 때까지
-    위로 확장한다.
-    오목한(concave) 형상은 dy에 대한 간섭 여부가 단조롭지 않을 수 있다
-    (예: 위에서 내려오다 한 번 닿았다가 다시 떨어지고 더 아래에서 다시 닿는 경우).
-    그래서 [y_floor, hi] 구간의 양 끝만 보고 바로 이진탐색을 하면 중간의 실제
-    접촉 구간을 건너뛰고 y_floor를 "완전히 비어있는 안전한 자리"로 오판해
-    부품이 극단적으로 멀리 떨어진(비정상적으로 넓은 소재폭) 결과를 낼 수 있다.
-    이를 막기 위해 먼저 hi에서부터 굵은 간격(coarse_step)으로 내려가며 '처음
-    간섭이 시작되는 지점'을 찾고, 그 좁은 구간 안에서만 이진탐색으로 정밀화한다.
-    coarse_step은 호출부에서 bridge(최소 브릿지 폭) 기준으로 정해 전달한다 —
-    이 폭보다 좁은 진짜 맞물림 틈은 애초에 실제 금형에서 의미가 없고, 반대로
-    이 스텝이 bridge보다 크면 실존하는 좁은 맞물림 구간을 건너뛰어 "배치 불가"로
-    잘못 판정할 위험이 있다."""
     hi = y_start
     span = max(y_start - y_floor, 1.0)
     guard = 0
@@ -131,7 +132,7 @@ def _min_y_gap(base_tiled, template, dx, y_start, y_floor, coarse_step, tol=ROW_
         hi += span
         guard += 1
     if base_tiled.intersects(translate(template, xoff=dx, yoff=hi)):
-        return None  # 확장해도 간섭을 벗어나지 못함 -> 이 dx는 사용 불가
+        return None  
 
     coarse_step = max(coarse_step, tol)
     safe_y, y = hi, hi
@@ -144,7 +145,7 @@ def _min_y_gap(base_tiled, template, dx, y_start, y_floor, coarse_step, tol=ROW_
         safe_y = y
 
     if contact_lo is None:
-        return None  # 바닥까지 내려도 실질적인 접촉이 전혀 없는 dx -> 유효한 후보 아님
+        return None  
 
     lo, hi = contact_lo, safe_y
     while hi - lo > tol:
@@ -156,20 +157,10 @@ def _min_y_gap(base_tiled, template, dx, y_start, y_floor, coarse_step, tol=ROW_
     return hi
 
 def _dx_samples(p_base, target_step=1.5, min_n=48, max_n=140):
-    """탐색할 dx 격자점 수를 피치 크기에 맞춰 적응적으로 정한다.
-    고정 90분할은 피치가 큰 부품에서 격자 간격이 수 mm까지 벌어져
-    실제 최적 오프셋을 건너뛸 수 있어, 목표 간격(target_step)을 기준으로 늘린다.
-    각도(최대 36개) x dx 격자점 x 부품 쌍마다 _min_y_gap(내부에서 최대 수십 회
-    intersects 호출)이 반복 호출되므로, 격자점 수가 커지면 전체 연산량이 급격히
-    늘어난다. min_n/max_n을 너무 크게 잡으면 복잡한 실제 DXF 부품에서 재계산이
-    체감될 정도로 느려질 수 있어 실용적인 범위로 제한한다."""
     n = int(np.clip(p_base / target_step, min_n, max_n))
     return np.linspace(0, p_base, n, endpoint=False)
 
 def _row_coarse_step(h, bridge):
-    """행간 접촉점을 찾는 굵은 탐색의 스텝 크기.
-    bridge/2보다 크게 잡으면 브릿지 폭 정도의 좁은 맞물림 구간을 건너뛰어
-    '배치 불가'로 잘못 판정할 수 있어 bridge에 비례하도록 상한을 둔다."""
     return max(0.5, min(h / 20, bridge / 2))
 
 def find_nesting_offset(part_a, part_b, p_base, bridge):
@@ -196,7 +187,6 @@ def find_nesting_offset(part_a, part_b, p_base, bridge):
         return best_dx, best_dy, unary_union([part_a, best_part_b]), best_part_b
     return None, None, None, None
 
-# --- Claude 다열 적층(Stacking) 알고리즘 적용 ---
 def _tile_row_x(buffered_geom, p_base, extra_reps=2):
     minx, miny, maxx, maxy = buffered_geom.bounds
     w = maxx - minx
@@ -234,12 +224,9 @@ def build_stacked_rows(rotated_part, num_rows, p_base, bridge):
     return rows_placed
 
 def check_multi_row_clash(parts, bridge):
-    """모든 행 쌍(인접하지 않은 조합 포함)에 대해 브릿지 간섭 여부를 검사한다.
-    기존에는 0행과 나머지 행만 비교해 예를 들어 1행-3행처럼 0행이 끼지 않는
-    조합의 간섭을 놓칠 수 있었다 (num_rows>=4에서 실제로 발생 가능)."""
     if len(parts) < 3: return False
     for r1, r2 in itertools.combinations(range(len(parts)), 2):
-        if abs(r1 - r2) == 1: continue  # 인접 행은 배치 단계에서 이미 검증됨
+        if abs(r1 - r2) == 1: continue  
         buf = parts[r1].buffer(bridge - 0.05, resolution=BRIDGE_BUFFER_RESOLUTION)
         if buf.intersects(parts[r2]): return True
     return False
@@ -248,9 +235,8 @@ def row_colors(n):
     palette = ['#004b87', '#007934', '#d55e00', '#9b59b6', '#c0392b', '#16a085']
     return [palette[i % len(palette)] for i in range(n)]
 
-
 # ============================================================
-# [2] DXF 읽기 및 시각화 (버그 픽스 + 블록 분해)
+# [2] DXF 읽기 및 시각화
 # ============================================================
 def extract_entities_recursive(entity_container, fail_log=None):
     target_types = {'LWPOLYLINE', 'POLYLINE', 'CIRCLE', 'ELLIPSE', 'SPLINE'}
@@ -289,12 +275,7 @@ def read_part_with_holes(msp, unit_factor):
 
     if not candidates: return None, [], fail_log
 
-    # 외곽 윤곽선은 정의상 모든 홀보다 항상 면적이 크므로(홀은 외곽 내부에 포함),
-    # 원형 여부(circularity)로 후보를 걸러낼 필요가 없다.
-    # 예전 로직은 부품 외곽 자체가 원형(와셔, 디스크 등)인데 내부에 비원형
-    # 홀(슬롯, D컷 등)이 하나라도 있으면 그 홀을 외곽선으로 오인하는 버그가 있었다.
     outer = max(candidates, key=lambda a: a.area)
-
     holes = [c for c in candidates if c is not outer and outer.contains(c.buffer(-1e-6))]
     net_part = Polygon(outer.exterior.coords, [h.exterior.coords for h in holes]) if holes else outer
     return net_part, holes, fail_log
@@ -358,9 +339,10 @@ def render_case_column(col, label, results, best, used_fallback, colors, margin,
 
 
 # ============================================================
-# [4] 데이터 추출 헬퍼 (DXF / Excel / PDF)
+# [4] 데이터 추출 헬퍼 (DXF / Excel / PDF) 및 공정 텍스트 렌더링
 # ============================================================
-def plot_strip_layout(parts_and_colors, pitch, part_zone_width, margin, carrier_width, pilot_dia, total_stations):
+def plot_strip_layout(parts_and_colors, pitch, part_zone_width, margin, carrier_width, pilot_dia, sequence_df):
+    total_stations = max(1, len(sequence_df))
     strip_width = part_zone_width + carrier_width * 2
     all_geoms = unary_union([p[0] for p in parts_and_colors])
     minx, miny, maxx, maxy = all_geoms.bounds
@@ -370,10 +352,13 @@ def plot_strip_layout(parts_and_colors, pitch, part_zone_width, margin, carrier_
     fig, ax = plt.subplots(figsize=(max(8, total_stations * 2), 4))
     ax.plot([0, total_length, total_length, 0, 0], [0, 0, strip_width, strip_width, 0],
             color='red', linestyle='-', linewidth=2.5, label=f'금형 코어 최소 사이즈\n(가로: {total_length:.1f} x 세로: {strip_width:.1f})')
+    
+    # 텍스트가 잘리지 않도록 상단에 투명한 여백 선 추가
+    ax.plot([0, total_length], [strip_width + margin + 10, strip_width + margin + 10], color='none')
 
     if carrier_width > 0:
         ax.add_patch(Rectangle((0, 0), total_length, carrier_width, facecolor='#999999', alpha=0.25, edgecolor='none', zorder=1))
-        ax.add_patch(Rectangle((0, strip_width - carrier_width), total_length, carrier_width, facecolor='#999999', alpha=0.25, edgecolor='none', label='캐리어(스켈레톤) 영역', zorder=1))
+        ax.add_patch(Rectangle((0, strip_width - carrier_width), total_length, carrier_width, facecolor='#999999', alpha=0.25, edgecolor='none', label='캐리어 영역', zorder=1))
 
     y_offset, x_offset = -miny + margin + carrier_width, -minx + (pitch * 0.2)
 
@@ -386,19 +371,26 @@ def plot_strip_layout(parts_and_colors, pitch, part_zone_width, margin, carrier_
             ax.add_patch(Circle((pitch * (i + 0.5), carrier_width / 2), pilot_dia / 2, facecolor='white', edgecolor='black', linewidth=1.2, zorder=5))
         if i < total_stations - 1:
             ax.plot([pitch * (i + 1), pitch * (i + 1)], [0, strip_width], color='black', linestyle=':', alpha=0.4, zorder=1)
+        
+        # [NEW] 공정 텍스트 렌더링 반영
+        if i < len(sequence_df):
+            stage_name = sequence_df.iloc[i]['공정명']
+            ax.text(pitch * (i + 0.5), strip_width + (margin * 0.2), f"S{i+1}\n{stage_name}",
+                    ha='center', va='bottom', fontsize=9, color='#004b87', fontweight='bold')
 
     ax.axis('equal'); ax.set_xticks([]); ax.set_yticks([])
     ax.legend(loc='center left', bbox_to_anchor=(1.02, 0.5))
     plt.tight_layout()
     return fig
 
-def render_strip_section(label, best, total_stations, margin, carrier_width, pilot_dia, colors):
+def render_strip_section(label, best, sequence_df, margin, carrier_width, pilot_dia, colors):
+    total_stations = max(1, len(sequence_df))
     all_geoms = unary_union(best['parts'])
     minx, miny, maxx, maxy = all_geoms.bounds
     l_val = (best['p'] * (total_stations - 1)) + (maxx - minx) + (best['p'] * 0.4)
     
     st.info(f"📐 **{label} 금형 코어 최소 사이즈:** 가로(L) :blue[**{l_val:.1f} mm**] × 세로(W) :blue[**{best['w']:.1f} mm**] (캐리어 {carrier_width}mm 포함)  |  피치(P) :blue[**{best['p']:.2f} mm**] × **{total_stations}**스테이션")
-    fig = plot_strip_layout(list(zip(best['parts'], colors)), best['p'], best['w'] - carrier_width * 2, margin, carrier_width, pilot_dia, total_stations)
+    fig = plot_strip_layout(list(zip(best['parts'], colors)), best['p'], best['w'] - carrier_width * 2, margin, carrier_width, pilot_dia, sequence_df)
     st.pyplot(fig)
 
 def generate_dxf_bytes(tuned_parts, tune_pitch, tune_width, total_stations, margin, carrier_width, pilot_dia, x_shift, y_shift):
@@ -493,25 +485,14 @@ bridge = st.sidebar.number_input("부품간 최소 간격 (mm)", value=float(rou
 margin = st.sidebar.number_input("가장자리 마진 (mm)", value=float(round(rec_margin, 1)), step=0.1)
 
 st.sidebar.header("🧱 3-1. 다열(N행) 설정")
-num_rows = st.sidebar.number_input("배치 행 수", value=2, min_value=2, max_value=2, step=1, help="다열(교차/지그재그) 배열 시뮬레이션에 적용됩니다. 단일 배열은 1열로 고정됩니다. 계산 속도를 위해 2행으로 제한되어 있습니다.")
+num_rows = st.sidebar.number_input("배치 행 수", value=2, min_value=2, max_value=2, step=1, help="다열(교차/지그재그) 배열 시뮬레이션에 적용됩니다. 단일 배열은 1열로 고정됩니다.")
 
 st.sidebar.header("🔧 3. 캐리어 & 파일럿")
 carrier_width = st.sidebar.number_input("캐리어 폭 (mm)", value=float(round(max(4.0, 3*material_thickness), 1)), step=0.5)
 pilot_dia = st.sidebar.number_input("파일럿 홀 지름 (mm)", value=4.0, step=0.5)
 
-st.sidebar.header("🛠️ 4. 레이아웃 설계")
-st_notch = st.sidebar.number_input("노칭 / 파일럿 홀", value=1, step=1)
-st_pierce = st.sidebar.number_input("피어싱", value=1, step=1)
-st_bend = st.sidebar.number_input("벤딩", value=0, step=1)
-st_form = st.sidebar.number_input("포밍", value=0, step=1)
-st_final_notch = st.sidebar.number_input("최종 낙하", value=1, step=1)
-st_idle = st.sidebar.number_input("아이들 피치", value=1, step=1)
-st_simul = st.sidebar.number_input("➖ 동시 성형 (차감)", value=0, step=1)
-total_stations = max(1, int((st_notch + st_pierce + st_bend + st_form + st_final_notch + st_idle) - st_simul))
-st.sidebar.info(f"**총 예상 스테이션: {total_stations} 피치**")
-
 st.sidebar.header("🧭 5. 압연방향(그레인)")
-apply_rolling_constraint = st.sidebar.checkbox("벤딩 라인 제약 적용", value=(st_bend > 0))
+apply_rolling_constraint = st.sidebar.checkbox("벤딩 라인 제약 적용", value=False)
 bend_angles_input = st.sidebar.text_input("벤딩 각도 (°, 쉼표구분)", value="0", disabled=not apply_rolling_constraint)
 min_angle_from_rolling = st.sidebar.number_input("최소 이격각 (°)", value=30.0, step=5.0, disabled=not apply_rolling_constraint)
 
@@ -522,7 +503,7 @@ if apply_rolling_constraint:
 
 
 # ============================================================
-# [6] 메인 화면 및 연산 로직 (Stacking 알고리즘)
+# [6] 메인 화면 및 연산 로직
 # ============================================================
 st.markdown("#### 📂 1. 도면 업로드")
 uploaded_file = st.file_uploader("DXF 전개도면을 업로드하세요.", type=['dxf'])
@@ -537,7 +518,7 @@ recalculated = False
 if uploaded_file is not None:
     if st.session_state.last_params != current_params:
         recalculated = True
-        with st.spinner('도면을 읽는 중입니다...'):
+        with st.spinner('도면을 읽고 공정을 기획하는 중입니다...'):
             with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp:
                 tmp.write(uploaded_file.getvalue()); tmp_path = tmp.name
             doc = ezdxf.readfile(tmp_path)
@@ -549,6 +530,10 @@ if uploaded_file is not None:
             if part is None: st.error("❌ 다각형 정보를 찾을 수 없습니다."); st.stop()
             if part.geom_type == 'MultiPolygon': part = max(part.geoms, key=lambda a: a.area)
             part_area, pair_area = part.area, part.area * 2
+            
+            # [NEW] 도면 파싱 후 자동 시퀀스 생성 로직 연결
+            st.session_state['holes_count'] = len(holes)
+            st.session_state.sequence_df = generate_sequence_layout(len(holes), apply_rolling_constraint, len(bend_line_angles))
 
         single_results, inter_results, zigzag_results = [], [], []
         best_s = best_i = best_z = fallback_s = fallback_i = fallback_z = None
@@ -577,7 +562,7 @@ if uploaded_file is not None:
             if not fallback_s or util_s > fallback_s['util']: fallback_s = rec_s
             if valid and (not best_s or util_s > best_s['util']): best_s = rec_s
 
-            # [2] N열 교차 배열 (Fast Vector Copy)
+            # [2] N열 교차 배열 
             part_180 = rotate(rotated_part, 180, origin='centroid')
             dx_i1, dy_i1, _, _ = find_nesting_offset(rotated_part, part_180, p_base, bridge)
             if dx_i1 is not None:
@@ -598,7 +583,7 @@ if uploaded_file is not None:
                         if not fallback_i or util_i > fallback_i['util']: fallback_i = rec_i
                         if valid and (not best_i or util_i > best_i['util']): best_i = rec_i
 
-            # [3] N열 지그재그 배열 (Claude's Stacking Algorithm)
+            # [3] N열 지그재그 배열
             zigzag_rows = build_stacked_rows(rotated_part, num_rows, p_base, bridge)
             n_rows_actual = len(zigzag_rows)
             if n_rows_actual >= 2:
@@ -613,7 +598,7 @@ if uploaded_file is not None:
 
         progress_bar.empty()
         st.session_state.update({
-            'part_area': part_area, 'holes_count': len(holes), 'holes_area': sum(h.area for h in holes) if holes else 0.0,
+            'part_area': part_area, 'holes_area': sum(h.area for h in holes) if holes else 0.0,
             'single': (single_results, best_s or fallback_s, not best_s),
             'inter': (inter_results, best_i or fallback_i, not best_i),
             'zigzag': (zigzag_results, best_z or fallback_z, not best_z),
@@ -621,6 +606,24 @@ if uploaded_file is not None:
             'parse_fail_log': parse_fail_log,
         })
         st.session_state.last_params = current_params
+
+    # ============================================================
+    # [NEW] 파일 업로드 시에만 사이드바에 공정표(Editor) 생성
+    # ============================================================
+    st.sidebar.header("🛠️ 4. 예상 레이아웃 기획 (Sequence)")
+    st.sidebar.caption("💡 도면 특징(Hole, 벤딩)을 분석하여 자동 기획되었습니다. (직접 수정/추가 가능)")
+    
+    edited_seq_df = st.sidebar.data_editor(
+        st.session_state.sequence_df,
+        num_rows="dynamic",
+        use_container_width=True,
+        key=f"seq_editor_{file_hash}"
+    )
+    st.session_state.sequence_df = edited_seq_df
+    total_stations = max(1, len(edited_seq_df))
+    st.sidebar.info(f"**총 예상 스테이션: {total_stations} 피치**")
+
+    # ============================================================
 
     s_res, best_s, s_fall = st.session_state['single']
     i_res, best_i, i_fall = st.session_state['inter']
@@ -631,7 +634,8 @@ if uploaded_file is not None:
         with st.expander(f"⚠️ 도면 해석에 실패한 요소 {len(st.session_state['parse_fail_log'])}건 (형상/면적 계산에서 제외됨)"):
             for msg in st.session_state['parse_fail_log']:
                 st.text(msg)
-    if st.session_state['holes_count'] > 0: st.info(f"🕳️ 내측 홀 **{st.session_state['holes_count']}개** (순단면적 반영 완료)")
+    if st.session_state.get('holes_count', 0) > 0: 
+        st.info(f"🕳️ 내측 홀 **{st.session_state['holes_count']}개** 검출 (순단면적 반영 및 공정표 자동 연동 완료)")
 
     cands = [('단일 배열', best_s)]
     if best_i: cands.append((f'{num_rows}열 교차 배열', best_i))
@@ -651,12 +655,12 @@ if uploaded_file is not None:
     st.divider()
     st.header("🎞️ [2단계] 스트립 Layout도 및 금형 코어 사이즈 도출")
     st.subheader("◼️ [1] 단일 배열 Layout도")
-    render_strip_section("단일 배열", best_s, total_stations, margin, carrier_width, pilot_dia, ['#004b87'])
-    if best_i: st.divider(); st.subheader(f"◼️ [2] {num_rows}열 교차 배열 Layout도"); render_strip_section(f"{num_rows}열 교차 배열", best_i, total_stations, margin, carrier_width, pilot_dia, row_colors(len(best_i['parts'])))
-    if best_z: st.divider(); st.subheader(f"◼️ [3] {best_z.get('n_rows', num_rows)}열 지그재그 배열 Layout도"); render_strip_section(f"{best_z.get('n_rows', num_rows)}열 지그재그 배열", best_z, total_stations, margin, carrier_width, pilot_dia, row_colors(len(best_z['parts'])))
+    render_strip_section("단일 배열", best_s, st.session_state.sequence_df, margin, carrier_width, pilot_dia, ['#004b87'])
+    if best_i: st.divider(); st.subheader(f"◼️ [2] {num_rows}열 교차 배열 Layout도"); render_strip_section(f"{num_rows}열 교차 배열", best_i, st.session_state.sequence_df, margin, carrier_width, pilot_dia, row_colors(len(best_i['parts'])))
+    if best_z: st.divider(); st.subheader(f"◼️ [3] {best_z.get('n_rows', num_rows)}열 지그재그 배열 Layout도"); render_strip_section(f"{best_z.get('n_rows', num_rows)}열 지그재그 배열", best_z, st.session_state.sequence_df, margin, carrier_width, pilot_dia, row_colors(len(best_z['parts'])))
 
     # ============================================================
-    # [7] 수동 미세 조정 (Gemini의 직관적인 Step-Offset 융합 UI)
+    # [7] 수동 미세 조정 
     # ============================================================
     st.divider()
     st.header("🛠️ [3단계] 수동 미세 조정 (Fine-Tuning)")
@@ -696,7 +700,6 @@ if uploaded_file is not None:
     delta_angle = tune_angle - target_best['angle']
     tuned_parts = []
     
-    # Gemini의 핵심 강점: 행(Row)간 일괄 Step Offset 적용
     for idx, geom in enumerate(target_best['parts']):
         g = rotate(geom, delta_angle, origin=center_geom.centroid)
         g = translate(g, 0, tune_y_all)  
@@ -711,9 +714,6 @@ if uploaded_file is not None:
     base_min_pitch = calculate_1d_pitch(tuned_parts[0], bridge)
     if tune_pitch < base_min_pitch - interference_tol: is_clashing = True
     else:
-        # 모든 행 쌍(인접하지 않은 조합 포함)을 같은 스테이션 내 / ±피치 이동 상태 모두 검사한다.
-        # 기존에는 (r-1, r) 인접 쌍만 검사해 0행-2행처럼 인접하지 않은 행끼리의
-        # 간섭(특히 사용자가 행간 오프셋을 직접 조정할 때)을 놓칠 수 있었다.
         row_bufs = [p.buffer(bridge - interference_tol, resolution=BRIDGE_BUFFER_RESOLUTION) for p in tuned_parts]
         for r in range(n_parts):
             for step in [-1, 1]:
@@ -740,6 +740,8 @@ if uploaded_file is not None:
 
     fig_tune, ax_tune = plt.subplots(figsize=(max(8, total_stations * 2), 4))
     ax_tune.plot([0, total_len_tuned, total_len_tuned, 0, 0], [0, 0, tune_width, tune_width, 0], color='red', linestyle='-', linewidth=2.5)
+    ax_tune.plot([0, total_len_tuned], [tune_width + margin + 10, tune_width + margin + 10], color='none')
+
     if carrier_width > 0:
         ax_tune.add_patch(Rectangle((0, 0), total_len_tuned, carrier_width, facecolor='#999999', alpha=0.25, edgecolor='none', zorder=1))
         ax_tune.add_patch(Rectangle((0, tune_width - carrier_width), total_len_tuned, carrier_width, facecolor='#999999', alpha=0.25, edgecolor='none', zorder=1))
@@ -752,18 +754,22 @@ if uploaded_file is not None:
             ax_tune.add_patch(Circle((tune_pitch * (i + 0.5), carrier_width / 2), pilot_dia / 2, facecolor='white', edgecolor='black', linewidth=1.2, zorder=5))
         if i < total_stations - 1:
             ax_tune.plot([tune_pitch * (i + 1), tune_pitch * (i + 1)], [0, tune_width], color='black', linestyle=':', alpha=0.4, zorder=1)
+            
+        # [NEW] 튜닝 화면 공정 텍스트 렌더링 반영
+        if i < len(st.session_state.sequence_df):
+            stage_name = st.session_state.sequence_df.iloc[i]['공정명']
+            ax_tune.text(tune_pitch * (i + 0.5), tune_width + (margin * 0.2), f"S{i+1}\n{stage_name}",
+                         ha='center', va='bottom', fontsize=10, color='darkred', fontweight='bold')
 
-    ax_tune.axis('equal'); ax_tune.set_xticks([]); ax_tune.set_yticks([]) # <--- [디버깅 완료: set_yticks([]) 빈 리스트 추가]
+    ax_tune.axis('equal'); ax_tune.set_xticks([]); ax_tune.set_yticks([])
     st.pyplot(fig_tune)
 
     # ============================================================
-    # [8] 데이터 추출 및 내보내기 (DXF / Excel / PDF)
+    # [8] 데이터 추출 및 내보내기 
     # ============================================================
     st.divider()
     st.header("💾 [4단계] 데이터 추출 및 내보내기")
 
-    # 튜닝 값이 실제로 안 바뀌었으면(예: 다른 위젯을 건드려 화면이 다시 그려진 경우)
-    # DXF/Excel/PDF를 다시 만들지 않고 직전 결과를 재사용한다.
     export_sig = (file_hash, tune_target_name, tune_angle, tune_pitch, tune_width,
                   tune_y_all, tune_x_step, tune_y_step, total_stations, margin,
                   carrier_width, pilot_dia, mat_type, material_thickness,
@@ -777,8 +783,12 @@ if uploaded_file is not None:
         pdf_bytes = generate_pdf_report(fig_tune, tune_target_name, tune_pitch, tune_width, tune_util, tune_cost, total_stations, mat_type, material_thickness)
         st.session_state['export_cache'] = (export_sig, dxf_bytes, excel_bytes, pdf_bytes)
 
-
     col_dxf, col_xls, col_pdf = st.columns(3)
     with col_dxf: st.download_button("📥 DXF 도면 다운로드", data=dxf_bytes, file_name="optimized_strip.dxf", mime="application/dxf", type="primary", use_container_width=True)
     with col_xls: st.download_button("📥 Excel 데이터 다운로드", data=excel_bytes, file_name="layout_report.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary", use_container_width=True)
     with col_pdf: st.download_button("📥 PDF 리포트 다운로드", data=pdf_bytes, file_name="layout_report.pdf", mime="application/pdf", type="primary", use_container_width=True)
+
+# 파일 업로드가 안 된 초기 상태일 경우 빈 사이드바 메뉴 렌더링
+elif uploaded_file is None:
+    st.sidebar.header("🛠️ 4. 예상 레이아웃 기획")
+    st.sidebar.caption("도면을 업로드하면 공정이 자동 기획됩니다.")
